@@ -21,14 +21,19 @@ struct Provider: Identifiable, Codable, Equatable {
     var isPreset: Bool
     var defaultModel: String
     var kind: ProviderKind
+    /// Name of the `FreeProviderTemplate` this row was created from, nil for
+    /// everything else. Drives the "Free" badge and the get-a-key notice in
+    /// Settings; the row is otherwise an ordinary deletable custom provider.
+    var freeTemplate: String?
 
-    init(id: UUID, name: String, baseURL: String, isPreset: Bool, defaultModel: String, kind: ProviderKind = .openAICompatible) {
+    init(id: UUID, name: String, baseURL: String, isPreset: Bool, defaultModel: String, kind: ProviderKind = .openAICompatible, freeTemplate: String? = nil) {
         self.id = id
         self.name = name
         self.baseURL = baseURL
         self.isPreset = isPreset
         self.defaultModel = defaultModel
         self.kind = kind
+        self.freeTemplate = freeTemplate
     }
 
     // Provider lists persisted before the ChatGPT kind existed have no `kind` field.
@@ -46,7 +51,82 @@ struct Provider: Identifiable, Codable, Equatable {
         // the first time a newer build's provider kind is seen by this build.
         let rawKind = try container.decodeIfPresent(String.self, forKey: .kind)
         kind = rawKind.flatMap(ProviderKind.init(rawValue:)) ?? .openAICompatible
+        freeTemplate = try container.decodeIfPresent(String.self, forKey: .freeTemplate)
     }
+}
+
+/// A curated free-tier provider the Add Provider menu can instantiate
+/// preconfigured: the correct OpenAI-compatible base URL plus where to get a
+/// key. Static facts only — models come from the live `/models` fetch once a
+/// key is set, and rate limits are deliberately not encoded here (they rot;
+/// `directoryURL` is the maintained catalog). Every entry's `/models` route was
+/// live-verified OpenAI-shaped on 2026-08-04. GitHub Models is deliberately
+/// absent: its model listing is not OpenAI-shaped (`…/inference/models`
+/// answers 410; the catalog lives elsewhere), so PopChat's client can't
+/// complete setup against it. OpenRouter's free models need no entry — the
+/// standing OpenRouter preset already covers them.
+struct FreeProviderTemplate: Identifiable {
+    let name: String
+    let baseURL: String
+    /// Where the user creates an API key — the Settings band notice links here.
+    let keyURL: String
+    /// One caveat worth stating up front (plan opt-in, credit model), or nil.
+    let note: String?
+
+    var id: String { name }
+
+    static let all: [FreeProviderTemplate] = [
+        FreeProviderTemplate(
+            name: "Groq",
+            baseURL: "https://api.groq.com/openai/v1",
+            keyURL: "https://console.groq.com/keys",
+            note: nil
+        ),
+        FreeProviderTemplate(
+            name: "Google Gemini",
+            baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+            keyURL: "https://aistudio.google.com/apikey",
+            note: nil
+        ),
+        FreeProviderTemplate(
+            name: "Mistral",
+            baseURL: "https://api.mistral.ai/v1",
+            keyURL: "https://console.mistral.ai/api-keys",
+            note: "free use needs the Experiment plan enabled in the console"
+        ),
+        FreeProviderTemplate(
+            name: "Cerebras",
+            baseURL: "https://api.cerebras.ai/v1",
+            keyURL: "https://cloud.cerebras.ai",
+            note: nil
+        ),
+        FreeProviderTemplate(
+            name: "NVIDIA NIM",
+            baseURL: "https://integrate.api.nvidia.com/v1",
+            keyURL: "https://build.nvidia.com",
+            note: nil
+        ),
+        FreeProviderTemplate(
+            name: "Cohere",
+            baseURL: "https://api.cohere.ai/compatibility/v1",
+            keyURL: "https://dashboard.cohere.com/api-keys",
+            note: "trial keys have a monthly request cap"
+        ),
+        FreeProviderTemplate(
+            name: "Hugging Face",
+            baseURL: "https://router.huggingface.co/v1",
+            keyURL: "https://huggingface.co/settings/tokens",
+            note: "a small monthly credit rather than an unlimited tier"
+        ),
+    ]
+
+    static func named(_ name: String?) -> FreeProviderTemplate? {
+        all.first { $0.name == name }
+    }
+
+    /// The upstream community catalog this list is curated from — linked from
+    /// the Add Provider menu as the full, maintained guide.
+    static let directoryURL = URL(string: "https://github.com/cheahjs/free-llm-api-resources")!
 }
 
 /// The two attachment content kinds whose provider support varies by model.
@@ -713,20 +793,38 @@ final class ProviderStore: ObservableObject {
 
     @discardableResult
     func addCustom() -> UUID {
-        // Distinct names: several blank "Custom" rows are indistinguishable in the
-        // switcher and in Settings' list.
-        var name = "Custom"
-        var suffix = 2
-        while providers.contains(where: { $0.name == name }) {
-            name = "Custom \(suffix)"
-            suffix += 1
-        }
-        let provider = Provider(id: UUID(), name: name, baseURL: "", isPreset: false, defaultModel: "")
+        let provider = Provider(id: UUID(), name: uniqueName("Custom"), baseURL: "", isPreset: false, defaultModel: "")
         providers.append(provider)
         // Deliberately does NOT select it (delta 5): Settings manages the catalog,
         // the panel's pill owns what the next message actually uses. Adding a
         // half-configured provider must not redirect the live conversation.
         return provider.id
+    }
+
+    /// Adds a row preconfigured from a free-tier template — a normal custom
+    /// provider (deletable, images-optimistic) that remembers its origin so
+    /// Settings can badge it "Free" and link where the key comes from. Same
+    /// never-select law as `addCustom()`.
+    @discardableResult
+    func addTemplate(_ template: FreeProviderTemplate) -> UUID {
+        let provider = Provider(
+            id: UUID(), name: uniqueName(template.name), baseURL: template.baseURL,
+            isPreset: false, defaultModel: "", freeTemplate: template.name
+        )
+        providers.append(provider)
+        return provider.id
+    }
+
+    /// Distinct names: duplicate rows are indistinguishable in the switcher and
+    /// in Settings' list.
+    private func uniqueName(_ base: String) -> String {
+        var name = base
+        var suffix = 2
+        while providers.contains(where: { $0.name == name }) {
+            name = "\(base) \(suffix)"
+            suffix += 1
+        }
+        return name
     }
 
     /// Deletes a custom provider (presets stay). Drops its key and cached model

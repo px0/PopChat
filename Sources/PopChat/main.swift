@@ -2042,7 +2042,9 @@ if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
         let chatgpt = ProviderStore.chatGPTPreset()
         let router = Provider(id: UUID(), name: "OpenRouter", baseURL: "https://openrouter.ai/api/v1", isPreset: true, defaultModel: "openrouter/auto")
         let ollama = Provider(id: UUID(), name: "Ollama (local)", baseURL: "http://localhost:11434/v1", isPreset: true, defaultModel: "")
-        let groq = Provider(id: UUID(), name: "Groq", baseURL: "https://api.groq.com/openai/v1", isPreset: false, defaultModel: "llama-3.3-70b")
+        // Template-born (freeTemplate) so the settings shot exercises the Free
+        // badge and the get-a-key band notice.
+        let groq = Provider(id: UUID(), name: "Groq", baseURL: "https://api.groq.com/openai/v1", isPreset: false, defaultModel: "llama-3.3-70b", freeTemplate: "Groq")
         store.providers = [chatgpt, deepseek, groq, router, ollama]
         store.knownModels = [
             chatgpt.id: ChatGPTAuth.modelCatalog,
@@ -2323,6 +2325,38 @@ if CommandLine.arguments.contains("--smoke-providers") {
                         fail("addCustom() switched the live provider — Settings must never write selectedID")
                     }
                     store.remove(added)
+
+                    // Free-tier templates (2026-08-04): same never-select law,
+                    // unique names on re-add, the origin marker the Free badge
+                    // and band notice key on, and sane URLs (chat/completions
+                    // and models are appended, so no trailing slash).
+                    guard let template = FreeProviderTemplate.all.first else {
+                        fail("free template list is empty")
+                    }
+                    let firstAdd = store.addTemplate(template)
+                    let secondAdd = store.addTemplate(template)
+                    if store.selectedID != beta.id {
+                        fail("addTemplate() switched the live provider — Settings must never write selectedID")
+                    }
+                    let templateRows = store.providers.filter { [firstAdd, secondAdd].contains($0.id) }
+                    if Set(templateRows.map(\.name)).count != 2 {
+                        fail("re-adding a template did not unique its name")
+                    }
+                    if templateRows.contains(where: { $0.freeTemplate != template.name || $0.isPreset }) {
+                        fail("template rows must be custom providers carrying their free-tier origin")
+                    }
+                    for entry in FreeProviderTemplate.all {
+                        guard let url = URL(string: entry.baseURL), url.scheme == "https",
+                              !(url.host() ?? "").isEmpty, !entry.baseURL.hasSuffix("/") else {
+                            fail("free template \(entry.name) has a malformed base URL: \(entry.baseURL)")
+                        }
+                        if URL(string: entry.keyURL)?.scheme != "https" {
+                            fail("free template \(entry.name) has a malformed key URL: \(entry.keyURL)")
+                        }
+                    }
+                    store.remove(firstAdd)
+                    store.remove(secondAdd)
+                    print("free templates: inert add, unique names, origin marker, sane URLs")
 
                     // The green dot and the rail are one predicate: every
                     // configured provider is offered, and the only row the rail

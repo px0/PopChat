@@ -394,14 +394,12 @@ struct SettingsView: View {
                     Text(provider.name)
                         .font(.system(size: 13))
                         .lineLimit(1)
-                    if !provider.isPreset {
-                        Text("Custom")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .textCase(.uppercase)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-                            .foregroundStyle(.secondary)
+                    // One badge per row: "Free" states the more useful fact
+                    // (template rows are custom too — still deletable).
+                    if provider.freeTemplate != nil {
+                        providerBadge("Free", tint: .green)
+                    } else if !provider.isPreset {
+                        providerBadge("Custom", tint: nil)
                     }
                 }
                 Text(providerSubtitle(provider))
@@ -430,13 +428,45 @@ struct SettingsView: View {
         }
     }
 
+    /// Gray "Custom" / green "Free" chip beside the provider name.
+    private func providerBadge(_ text: String, tint: Color?) -> some View {
+        Text(text)
+            .font(.system(size: 9.5, weight: .semibold))
+            .textCase(.uppercase)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(
+                (tint ?? Color.primary).opacity(tint == nil ? 0.07 : 0.14),
+                in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+            )
+            .foregroundStyle(tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.secondary))
+    }
+
     private var addProviderRow: some View {
         HStack {
-            Button("Add Provider…") {
-                let id = store.addCustom()
-                keyDraft = ""
-                editingID = id
+            Menu {
+                Button("Custom…") {
+                    let id = store.addCustom()
+                    keyDraft = ""
+                    editingID = id
+                }
+                Section("Free tiers") {
+                    ForEach(FreeProviderTemplate.all) { template in
+                        Button(template.name) {
+                            let id = store.addTemplate(template)
+                            keyDraft = ""
+                            editingID = id
+                        }
+                    }
+                }
+                Divider()
+                Button("More free APIs…") {
+                    NSWorkspace.shared.open(FreeProviderTemplate.directoryURL)
+                }
+            } label: {
+                Text("Add Provider…")
             }
+            .fixedSize()
             Spacer()
         }
         .padding(.horizontal, 10)
@@ -520,6 +550,9 @@ struct SettingsView: View {
             } else if provider.kind == .codexAppServer {
                 codexAppServerRows
             } else if let index {
+                if let template = FreeProviderTemplate.named(provider.freeTemplate) {
+                    freeTierNotice(template)
+                }
                 if !provider.isPreset {
                     editorField("Name") {
                         TextField("", text: $store.providers[index].name)
@@ -567,6 +600,18 @@ struct SettingsView: View {
         .background(Color.primary.opacity(0.025))
         .overlay(alignment: .top) { Divider().opacity(0.7) }
         .overlay(alignment: .bottom) { Divider().opacity(0.7) }
+    }
+
+    /// The template row's slice of the free-APIs guide, stated where the key
+    /// gets pasted: where to create one, plus the template's single caveat.
+    /// Static facts only — limits and model lists rot, so they stay upstream
+    /// (the Add Provider menu links the full catalog).
+    private func freeTierNotice(_ template: FreeProviderTemplate) -> some View {
+        let caveat = template.note.map { " — \($0)" } ?? ""
+        return Text(.init("Free tier · [Get an API key](\(template.keyURL))\(caveat). Paste it below, then fetch the model list with ↻."))
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     /// Custom endpoints only: whether PDFs go over the wire as native `file`
