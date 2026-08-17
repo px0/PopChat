@@ -30,9 +30,19 @@
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!-- Providers are URLs the USER types (self-hosted vLLM/llama.cpp boxes, LAN
+	     servers, proxies), so cleartext HTTP has to be allowed for hosts unknown at
+	     build time. NSAllowsLocalNetworking alone covers only .local, unqualified
+	     names and private/link-local addresses — a plain-http provider on a public
+	     IP failed with "the App Transport Security policy requires the use of a
+	     secure connection", which read as "PopChat can't add http providers".
+	     NSAllowsArbitraryLoads subsumes local networking; do NOT keep both keys —
+	     macOS ignores NSAllowsArbitraryLoads whenever NSAllowsLocalNetworking is
+	     present (verified 2026-08-17: with both keys set, the same request is still
+	     blocked). -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsLocalNetworking</key>
+		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
 </dict>
