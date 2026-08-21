@@ -15,6 +15,10 @@ Tools/                   fake app-server fixtures used by the smoke harnesses
 
 `KeyboardShortcuts` is pinned to exactly 1.15.0: later versions use `#Preview` macros, which need full Xcode and fail to compile with the Command Line Tools alone.
 
+`build.sh` passes `--build-system swiftbuild`, and that is not a speed preference — do not drop it. SwiftPM generates the `Bundle.module` accessor differently per build engine. The default native engine emits the flavour written for a command-line tool, which looks for the resource bundle beside the executable and then at the absolute build directory of whoever compiled it. Inside an app bundle, "beside the executable" is `PopChat.app/` — and nothing may live at the root of a signed `.app`, because `codesign` refuses to seal it. So that candidate can never be satisfied, and every build fell through to the second one, which exists only on the build machine. Shipped copies trapped the moment the user opened the hotkey recorder. The `swiftbuild` engine emits the flavour Xcode uses, which looks in `Bundle.main.resourceURL` — `Contents/Resources`, where `build.sh` puts them.
+
+Because that failure is invisible on the machine that built it, `build.sh` runs `--smoke-bundles` against the packaged app before signing. Run by hand it only means something from inside `dist/PopChat.app`; a loose `.build/debug/PopChat` finds the bundles sitting next to it and passes either way.
+
 ## Test harnesses
 
 `swift build` produces `.build/debug/PopChat`, which doubles as a headless test harness — there is no XCTest suite; the flags below are the test suite.
@@ -26,6 +30,10 @@ POPCHAT_API_KEY=… .build/debug/PopChat --smoke-search       # tool-calling loo
 .build/debug/PopChat --smoke-typing                         # composer latency budget
 .build/debug/PopChat --smoke-scroll                         # transcript scroll perf
 .build/debug/PopChat --smoke-find                           # find-in-chat behavior
+```
+
+```sh
+dist/PopChat.app/Contents/MacOS/PopChat --smoke-bundles     # packaging: dependency resources resolve
 ```
 
 `--smoke-persist`, `--smoke-history`, `--smoke-minsize`, `--smoke-pasteable`, `--smoke-providers`, `--smoke-accent`, `--smoke-typewriter`, `--chatgpt-login` and `--smoke-chatgpt` cover the rest. `--check-codex-app-server` checks the installed Codex, ChatGPT login and available model catalog without starting a model turn; `--smoke-codex-refresh-coalescing` verifies overlapping checks share one process. `--shot <settings|general|switcher> <path> [--dark|--light]` renders a view to PNG in-process.

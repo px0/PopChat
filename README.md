@@ -27,7 +27,7 @@ Requires **macOS 14 or later**. The liquid-glass backdrop needs macOS 26; older 
 
 ## Build from source
 
-Needs a Swift toolchain — Xcode, or just the Command Line Tools (`xcode-select --install`).
+Needs a Swift toolchain — Xcode, or just the Command Line Tools (`xcode-select --install`). Swift 6.2 or newer, because `build.sh` needs `--build-system swiftbuild` to package the dependency resource bundles correctly; it stops with an explanation on an older one.
 
 ```sh
 git clone https://github.com/lec77/PopChat.git

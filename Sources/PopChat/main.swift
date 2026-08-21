@@ -1,4 +1,6 @@
 import AppKit
+import KeyboardShortcuts
+import SwiftMath
 import SwiftUI
 
 // Headless streaming checks (no UI):
@@ -2450,6 +2452,60 @@ if CommandLine.arguments.contains("--smoke-firstrun") {
             exit(failures.isEmpty ? 0 : 1)
         }
         app.run()
+    }
+}
+
+// Packaging check: do the dependencies that carry resources find them inside the
+// shipped app? Each such dependency resolves `Bundle.module` on first use and traps
+// if the bundle is missing, so there is no degraded mode to notice later — the app
+// dies the moment the user opens the hotkey recorder or a reply contains LaTeX.
+//
+// This has to run from inside dist/PopChat.app to mean anything, which is where
+// build.sh runs it. Run against .build/debug/PopChat it still passes when the app
+// bundle is broken, because a loose binary finds the bundles sitting next to it.
+if CommandLine.arguments.contains("--smoke-bundles") {
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        var failures: [String] = []
+        func check(_ passed: Bool, _ law: String) {
+            print("\(passed ? "ok  " : "FAIL") \(law)")
+            if !passed { failures.append(law) }
+        }
+
+        let home = Bundle.main.bundleURL
+        print("smoke-bundles: \(home.path)")
+        if home.pathExtension == "app" {
+            for name in ["KeyboardShortcuts_KeyboardShortcuts", "SwiftMath_SwiftMath"] {
+                let url = Bundle.main.resourceURL?.appendingPathComponent("\(name).bundle")
+                let present = url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+                check(present, "\(name).bundle ships in Contents/Resources")
+            }
+        } else {
+            print("note: not an app bundle — the checks below can be satisfied by the build directory")
+        }
+
+        // Returning from each of these at all is the assertion: a bundle that does
+        // not resolve traps inside the dependency rather than reporting anything.
+        // The values are checked too, so a bundle that resolves but is empty fails
+        // here instead of shipping blank placeholders and unrendered math.
+        let recorder = KeyboardShortcuts.RecorderCocoa(for: .togglePopChat)
+        check(
+            !(recorder.placeholderString ?? "").isEmpty,
+            "KeyboardShortcuts localizations load (Settings ▸ hotkey recorder)"
+        )
+
+        let (mathError, mathImage) = MTMathImage(
+            latex: "x^2", fontSize: 14, textColor: .labelColor, labelMode: .text
+        ).asImage()
+        check(
+            mathError == nil && (mathImage?.size.width ?? 0) > 0,
+            "SwiftMath math fonts load (LaTeX in a reply)"
+        )
+
+        print(failures.isEmpty ? "PASS" : "FAIL: \(failures.joined(separator: "; "))")
+        exit(failures.isEmpty ? 0 : 1)
     }
 }
 
