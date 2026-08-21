@@ -61,8 +61,6 @@ final class PanelController: NSObject, NSWindowDelegate {
         self.shortcutStore = shortcutStore
         self.chatStore = ChatStore(providerStore: providerStore, shortcutStore: shortcutStore)
         super.init()
-        // The launch resume already bumped the tick; only later restores count.
-        lastRestoreTick = chatStore.restoreTick
 
         // Grow to the remembered height when the first message lands; the shrink
         // back to compact is driven by the ChatView height report.
@@ -171,6 +169,10 @@ final class PanelController: NSObject, NSWindowDelegate {
     // Motion.
     func show() {
         isHiding = false
+        // Before the height decision below, which reads emptiness: a stale chat
+        // is cleared here, so a summon into a timed-out conversation opens at
+        // the compact size rather than snapping down after appearing.
+        chatStore.startFreshIfStale()
         if chatStore.messages.isEmpty {
             setContentHeight(lastCompactHeight ?? Self.compactMinHeight, animated: false)
         }
@@ -199,6 +201,7 @@ final class PanelController: NSObject, NSWindowDelegate {
     func hide() {
         guard panel.isVisible, !isHiding else { return }
         isHiding = true
+        chatStore.panelDidHide(pinned: state.pinned)
         if !reduceMotion, let layer = panel.contentView?.layer {
             let shrink = Self.transformAnimation(
                 from: CATransform3DIdentity,

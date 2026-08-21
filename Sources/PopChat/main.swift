@@ -256,6 +256,54 @@ if CommandLine.arguments.contains("--smoke-typewriter") {
     exit(failures.isEmpty ? 0 : 1)
 }
 
+// The ephemerality clock: when does a dismissed chat stop being "the current
+// chat"? Pure timestamp arithmetic, so it is checkable without a window server.
+//   .build/debug/PopChat --smoke-ephemeral
+if CommandLine.arguments.contains("--smoke-ephemeral") {
+    let now = Date(timeIntervalSinceReferenceDate: 1_000_000)
+    func ago(_ seconds: TimeInterval) -> Date { now.addingTimeInterval(-seconds) }
+    // Every probe is expressed as a MULTIPLE of the interval rather than in
+    // seconds, because none of what's asserted below depends on its value: the
+    // max() rule and the exclusive boundary hold whether the window is three
+    // minutes or thirty. Retuning ChatStore.staleAfter should move the probes
+    // with it, not break them.
+    let window = ChatStore.staleAfter
+    // (name, dismissal age, last-reply age — both × window, stale?)
+    let cases: [(name: String, closed: Double, stream: Double?, stale: Bool)] = [
+        ("just dismissed", 0.05, nil, false),
+        ("gone much longer", 20, nil, true),
+        // THE rule that makes this different from a plain dismissal timer: you
+        // asked a question, clicked away, and the answer arrived while you were
+        // gone. The wait must not count against the chat.
+        ("slow reply landed after dismissal", 1.1, 0.1, false),
+        // Symmetrically, a reply that finished BEFORE you dismissed carries no
+        // information — dismissal is later, so dismissal decides.
+        ("reply landed before dismissal", 0.1, 1.1, false),
+        ("reply landed before dismissal, both cold", 2, 5, true),
+        // The boundary is exclusive: at exactly the interval the chat survives.
+        ("exactly at the interval", 1, nil, false),
+        ("just past it", 1 + 1 / window, nil, true),
+    ]
+    var failures: [String] = []
+    for probe in cases {
+        let got = ChatStore.isStale(
+            closedAt: ago(probe.closed * window),
+            streamEndedAt: probe.stream.map { ago($0 * window) },
+            now: now
+        )
+        print(String(format: "%@ closed %5.0fs ago, reply %@ → %@ %@",
+                     probe.name.padding(toLength: 42, withPad: " ", startingAt: 0),
+                     probe.closed * window,
+                     probe.stream.map { String(format: "%.0fs ago", $0 * window) } ?? "none",
+                     got ? "fresh chat" : "keeps chat", got == probe.stale ? "ok" : "BAD"))
+        if got != probe.stale {
+            failures.append("\(probe.name): expected \(probe.stale ? "stale" : "current"), got the opposite")
+        }
+    }
+    print(failures.isEmpty ? "PASS" : "FAIL: " + failures.joined(separator: "; "))
+    exit(failures.isEmpty ? 0 : 1)
+}
+
 // User-installed Codex app-server check (no UI, no model turn/quota use):
 //   .build/debug/PopChat --check-codex-app-server
 if CommandLine.arguments.contains("--check-codex-app-server") {

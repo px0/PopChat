@@ -45,7 +45,7 @@ process that just bulk-inserted it measures a hot write-ahead log, not a launch.
 dist/PopChat.app/Contents/MacOS/PopChat --smoke-bundles     # packaging: dependency resources resolve
 ```
 
-`--smoke-persist`, `--smoke-history`, `--smoke-minsize`, `--smoke-pasteable`, `--smoke-providers`, `--smoke-accent`, `--smoke-typewriter`, `--chatgpt-login` and `--smoke-chatgpt` cover the rest. `--check-codex-app-server` checks the installed Codex, ChatGPT login and available model catalog without starting a model turn; `--smoke-codex-refresh-coalescing` verifies overlapping checks share one process. `--shot <settings|general|switcher> <path> [--dark|--light]` renders a view to PNG in-process.
+`--smoke-persist`, `--smoke-history`, `--smoke-minsize`, `--smoke-pasteable`, `--smoke-providers`, `--smoke-accent`, `--smoke-typewriter`, `--smoke-ephemeral`, `--chatgpt-login` and `--smoke-chatgpt` cover the rest. `--check-codex-app-server` checks the installed Codex, ChatGPT login and available model catalog without starting a model turn; `--smoke-codex-refresh-coalescing` verifies overlapping checks share one process. `--shot <settings|general|switcher> <path> [--dark|--light]` renders a view to PNG in-process.
 
 Three harnesses drive a fake app-server instead of the real one, so they cost no subscription quota and need no Codex install:
 

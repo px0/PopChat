@@ -103,11 +103,51 @@ final class ChatStore: ObservableObject {
     init(providerStore: ProviderStore, shortcutStore: ShortcutStore) {
         self.providerStore = providerStore
         self.shortcutStore = shortcutStore
-        // Resume the most recent conversation across app restarts.
+        // A launch always starts a fresh chat — PopChat is a scratchpad, and
+        // resurrecting whatever was open days ago is almost never what the
+        // hotkey means. Yesterday's chat is still in the store, one ⌘Y away.
         recent = ConversationStore.listRecent()
-        if let latest = recent.first, let loaded = ConversationStore.loadResolved(id: latest.id) {
-            adopt(loaded)
-        }
+    }
+
+    // MARK: - Ephemerality clock
+
+    /// How long a dismissed chat stays "the current chat". Summon inside this
+    /// window and you land back where you were; summon later and you get an
+    /// empty panel.
+    nonisolated static let staleAfter: TimeInterval = 180
+
+    /// When the panel was last hidden — nil while it is on screen, and also
+    /// while it is pinned (pinning is the explicit "keep this one around", so
+    /// it opts the conversation out of the clock entirely).
+    private var panelClosedAt: Date?
+
+    /// When the last reply finished arriving. A stream that lands after you
+    /// dismiss keeps the chat current: you asked for that answer, and the
+    /// waiting shouldn't count against you.
+    private var streamEndedAt: Date?
+
+    func panelDidHide(pinned: Bool, now: Date = Date()) {
+        panelClosedAt = pinned ? nil : now
+    }
+
+    /// Called from `show()`. Empties the panel when the chat has gone cold, so
+    /// the summon lands in a new conversation; the old one is already persisted
+    /// and sits at the top of the history list.
+    func startFreshIfStale(now: Date = Date()) {
+        guard !messages.isEmpty, !isStreaming, let closed = panelClosedAt else { return }
+        guard Self.isStale(closedAt: closed, streamEndedAt: streamEndedAt, now: now) else { return }
+        panelClosedAt = nil
+        newChat()
+    }
+
+    /// The whole decision, as a function of three timestamps — extracted so
+    /// `--smoke-ephemeral` can assert it without a window server.
+    nonisolated static func isStale(
+        closedAt: Date, streamEndedAt: Date?, now: Date, after: TimeInterval = staleAfter
+    ) -> Bool {
+        // The later of the two: dismissal, or a reply that finished after it.
+        let wentCold = max(closedAt, streamEndedAt ?? closedAt)
+        return now.timeIntervalSince(wentCold) > after
     }
 
     private func adopt(_ loaded: (conversation: Conversation, messages: [ChatMessage], missingParent: Bool)) {
@@ -363,6 +403,7 @@ final class ChatStore: ObservableObject {
                 }
             }
             if stillOurs { streamingMessageID = nil }
+            streamEndedAt = Date()
             persist()
         }
     }

@@ -53,8 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // time the block below runs it is gone.
         let loginItem = launchedAsLoginItem
 
-        // Build the panel + view hierarchy and load the resumed conversation off
-        // the critical path, so the first hotkey press shows a warm panel.
+        // Build the panel + view hierarchy off the critical path, so the first
+        // hotkey press shows a warm panel.
         DispatchQueue.main.async { [weak self] in
             self?.panelController.prewarm()
             self?.presentLaunchUI(loginItem: loginItem)
