@@ -716,11 +716,142 @@ if CommandLine.arguments.contains("--smoke-history-bench") {
     let resumed = list.first.flatMap { ConversationStore.loadResolved(id: $0.id) }
     let resumeMs = Double(DispatchTime.now().uptimeNanoseconds - resumeStart.uptimeNanoseconds) / 1_000_000
 
+    // The write side of the same tradeoff: a save recomputes the derived
+    // columns and rebuilds that conversation's full-text document, so a long
+    // transcript pays for its own length on every persisted turn. persist()
+    // runs once per turn rather than per token, which is what makes that
+    // affordable — if it ever moves into the streaming path, this is the number
+    // that stops being free.
+    var saveMs = 0.0
+    if let newest = list.first, let loaded = ConversationStore.load(id: newest.id) {
+        let saveStart = DispatchTime.now()
+        ConversationStore.save(loaded)
+        saveMs = Double(DispatchTime.now().uptimeNanoseconds - saveStart.uptimeNanoseconds) / 1_000_000
+    }
+
+    let searchStart = DispatchTime.now()
+    let found = ConversationStore.search("conversation")
+    let searchMs = Double(DispatchTime.now().uptimeNanoseconds - searchStart.uptimeNanoseconds) / 1_000_000
+
     print("conversations=\(count) imagesPerConv=\(imagesPer) storeBytes=\(bytes) (\(bytes / 1_048_576) MB)")
-    print(String(format: "listRecent=%.1fms loadResolved=%.1fms listed=%d stored=%d resumedMessages=%d",
-                 listMs, resumeMs, list.count, ConversationStore.count(), resumed?.messages.count ?? -1))
+    print(String(format: "listRecent=%.1fms search=%.1fms(%d hits) save=%.1fms loadResolved=%.1fms listed=%d stored=%d resumedMessages=%d",
+                 listMs, searchMs, found.count, saveMs, resumeMs,
+                 list.count, ConversationStore.count(), resumed?.messages.count ?? -1))
     if keptDirectory == nil { try? FileManager.default.removeItem(at: scratch) }
     exit(0)
+}
+
+// Cross-conversation full-text search (no network, no UI):
+//   .build/debug/PopChat --smoke-history-search
+if CommandLine.arguments.contains("--smoke-history-search") {
+    let scratch = FileManager.default.temporaryDirectory
+        .appendingPathComponent("popchat-histsearch-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    ConversationStore.overrideDirectory = scratch
+
+    var failures: [String] = []
+    func check(_ label: String, _ passed: Bool) {
+        if !passed { failures.append(label) }
+    }
+    func ids(_ query: String) -> Set<UUID> {
+        Set(ConversationStore.search(query, limit: 200).map(\.id))
+    }
+
+    let filler = String(repeating: "Ordinary prose that carries no distinctive terms at all. ", count: 8)
+
+    // "pomegranate" sits in the MIDDLE of a long assistant reply, so it appears
+    // in neither the title nor the stored 120-character snippet (which comes
+    // from the LAST message). This is precisely what the old title+snippet
+    // filter could never find.
+    let buried = Conversation(
+        id: UUID(), title: "quarterly planning",
+        updatedAt: Date().addingTimeInterval(-90 * 86_400),
+        messages: [
+            ChatMessage(role: .user, text: "quarterly planning"),
+            ChatMessage(role: .assistant, text: "\(filler) pomegranate \(filler)"),
+            ChatMessage(role: .user, text: "thanks"),
+        ]
+    )
+    ConversationStore.save(buried)
+
+    // Enough newer conversations to push `buried` past the display limit, so a
+    // filter over the visible page would no longer see it at all.
+    for index in 0..<(ConversationStore.defaultRecentLimit + 10) {
+        ConversationStore.save(Conversation(
+            id: UUID(), title: "filler \(index)",
+            updatedAt: Date().addingTimeInterval(Double(index)),
+            messages: [ChatMessage(role: .user, text: "filler \(index) \(filler)")]
+        ))
+    }
+
+    let listed = Set(ConversationStore.listRecent().map(\.id))
+    check("buried conversation should have fallen off the recent page", !listed.contains(buried.id))
+    check("body-text match beyond the recent page", ids("pomegranate") == [buried.id])
+    check("title match", ids("quarterly") == [buried.id])
+    check("prefix match while typing", ids("pomegr") == [buried.id])
+    check("multi-term match is AND", ids("pomegranate quarterly") == [buried.id])
+    check("non-matching term finds nothing", ids("rutabaga").isEmpty)
+
+    // The snippet shown for a hit must contain the hit, not the stored preview
+    // of the last message — otherwise a row appears with no visible reason.
+    let hit = ConversationStore.search("pomegranate").first
+    check("result snippet shows the match", hit?.snippet.contains("pomegranate") == true)
+
+    // FTS5 syntax typed by a user is text, not operators: each of these would be
+    // a parse error if the query were passed through raw.
+    for hostile in ["pomegranate\"", "pomegranate*", "\"", "*", "^", "NEAR", "pomegranate AND", "don't"] {
+        _ = ConversationStore.search(hostile)
+    }
+    check("quote-suffixed query still matches", ids("pomegranate\"") == [buried.id])
+    check("bare operator matches nothing rather than erroring", ids("NEAR").isEmpty)
+    check("punctuation-only query is not a search", ConversationStore.matchExpression(for: " *^\" ") == nil)
+
+    // A fork is findable by text it inherits and displays, and the UI-only rows
+    // that mark the divergence are NOT indexed.
+    let sharedTip = ChatMessage(role: .assistant, text: "the marzipan recipe")
+    let forkParent = Conversation(
+        id: UUID(), title: "Fork parent", updatedAt: Date(),
+        messages: [ChatMessage(role: .user, text: "ask"), sharedTip]
+    )
+    let forkChild = Conversation(
+        id: UUID(), title: "Fork child", updatedAt: Date(),
+        messages: [
+            ChatMessage(role: .activity, text: "Forked here — this branch diverges from the original."),
+            ChatMessage(role: .user, text: "follow up"),
+        ],
+        parentID: forkParent.id, forkMessageID: sharedTip.id
+    )
+    ConversationStore.save(forkParent)
+    ConversationStore.save(forkChild)
+    check("fork found by inherited text", ids("marzipan") == [forkParent.id, forkChild.id])
+    // Proves the next assertion is not vacuous: the fork IS indexed, so
+    // "diverges" being absent is the role filter doing its job rather than the
+    // whole conversation being missing from the index.
+    check("fork's own text is indexed", ids("follow") == [forkChild.id])
+    check("UI-only activity rows are not indexed", ids("diverges").isEmpty)
+
+    // Re-saving must replace the indexed text, not accumulate it.
+    ConversationStore.save(Conversation(
+        id: buried.id, title: "quarterly planning",
+        updatedAt: buried.updatedAt,
+        messages: [ChatMessage(role: .user, text: "replaced with elderflower")]
+    ))
+    check("stale text is dropped on re-save", ids("pomegranate").isEmpty)
+    check("new text is indexed on re-save", ids("elderflower") == [buried.id])
+
+    // The delete trigger must retract index entries, including via the
+    // materialization path that rewrites a child before removing its parent.
+    ConversationStore.delete(id: buried.id)
+    check("deleted conversation leaves the index", ids("elderflower").isEmpty)
+    ConversationStore.deleteMaterializingChildren(id: forkParent.id)
+    check("materialized fork keeps inherited text searchable", ids("marzipan") == [forkChild.id])
+
+    try? FileManager.default.removeItem(at: scratch)
+    if failures.isEmpty {
+        print("OK: full-text search across \(ConversationStore.defaultRecentLimit + 12) conversations — body text beyond the recent page, prefix and multi-term queries, hostile input, fork inheritance, reindex on save, delete retraction")
+    } else {
+        for failure in failures { print("FAIL: \(failure)") }
+    }
+    exit(failures.isEmpty ? 0 : 1)
 }
 
 // Attachment-loader check (no network): .build/debug/PopChat --smoke-file <path>

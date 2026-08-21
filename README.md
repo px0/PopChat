@@ -63,7 +63,7 @@ Local models need no key at all: run Ollama and pick its preset, or point a cust
 
 Secrets are a plain JSON file, not the Keychain: with ad-hoc signing every rebuild changes the binary identity, and macOS would then demand the login-keychain password on every launch. The file matches the trust model of the `.env` the keys usually come from.
 
-Conversations are kept indefinitely — nothing is deleted to make room, and the history popover simply asks for the newest 50. Versions before 0.1.3 stored one JSON file per conversation and are not carried over; those files are left where they are, and a fresh database starts empty.
+Conversations are kept indefinitely — nothing is deleted to make room, and the history popover simply asks for the newest 50. Typing in its filter field searches every conversation you have, matching full message text rather than just titles, and shows the text around each hit. Versions before 0.1.3 stored one JSON file per conversation and are not carried over; those files are left where they are, and a fresh database starts empty.
 
 ## Keyboard shortcuts
 
@@ -72,7 +72,7 @@ Conversations are kept indefinitely — nothing is deleted to make room, and the
 | ⌥Space | show / hide the panel (recordable) |
 | Esc | hide the panel |
 | ⌘N | new chat |
-| ⌘Y | history popover (↑/↓ select, ↩ open, ⌘⌫ delete) |
+| ⌘Y | history popover — type to search all chats (↑/↓ select, ↩ open, ⌘⌫ delete) |
 | ⌘F | find in chat (↑/↓ or ⌘G/⇧⌘G to step, ⎋ to close) |
 | ⌘E | large draft editor (⌘↩ sends) |
 | ⌘P | pin the panel open |

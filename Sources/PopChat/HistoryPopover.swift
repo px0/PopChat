@@ -15,6 +15,8 @@ struct HistoryPopover: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var filter = ""
+    /// Full-text results for the current query; empty while the filter is.
+    @State private var matches: [ConversationMeta] = []
     @State private var hoveredID: UUID?
     /// Keyboard selection, independent of hover. Preselected so ↩ works the
     /// instant the popover opens.
@@ -73,7 +75,13 @@ struct HistoryPopover: View {
             selectedID = visible.first?.id
             appeared = true
         }
-        .onChange(of: filter) { _, _ in selectedID = visible.first?.id }
+        .onChange(of: filter) { _, query in
+            // Asking for exactly what can be rendered: the list caps at
+            // renderCap, and a broad query against a large store would
+            // otherwise fetch rows nothing will ever draw.
+            matches = query.isEmpty ? [] : store.searchConversations(query, limit: Metrics.renderCap)
+            selectedID = visible.first?.id
+        }
     }
 
     // The filter row lands with the shell — only the list rows cascade.
@@ -222,6 +230,10 @@ struct HistoryPopover: View {
                     if ownsDelete {
                         Button {
                             store.deleteConversation(meta.id)
+                            // While filtering, the list is `matches`, which the
+                            // store's own refresh of `recent` does not touch —
+                            // without this the deleted row stays on screen.
+                            matches.removeAll { $0.id == meta.id }
                         } label: {
                             Image(systemName: "trash")
                                 .font(.system(size: 10))
@@ -282,12 +294,14 @@ struct HistoryPopover: View {
 
     // MARK: - Grouping & geometry
 
+    /// Filtering asks the store's full-text index rather than narrowing
+    /// `store.recent`. `recent` is only the newest page of a history that is
+    /// never pruned, and it carries a 120-character preview — matching against
+    /// it would miss both older conversations and anything said inside a
+    /// message. Results arrive via `matches`, refreshed when the query changes,
+    /// so the query does not re-run on every SwiftUI body evaluation.
     private var filtered: [ConversationMeta] {
-        guard !filter.isEmpty else { return store.recent }
-        return store.recent.filter {
-            $0.title.localizedCaseInsensitiveContains(filter)
-                || $0.snippet.localizedCaseInsensitiveContains(filter)
-        }
+        filter.isEmpty ? store.recent : matches
     }
 
     /// What actually renders — the render cap applies here so keyboard selection

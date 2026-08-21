@@ -31,6 +31,7 @@ POPCHAT_API_KEY=… .build/debug/PopChat --smoke-search       # tool-calling loo
 .build/debug/PopChat --smoke-scroll                         # transcript scroll perf
 .build/debug/PopChat --smoke-find                           # find-in-chat behavior
 .build/debug/PopChat --smoke-history-bench [convs] [images] # conversation-store startup cost
+.build/debug/PopChat --smoke-history-search                 # cross-conversation full-text search
 ```
 
 `--smoke-history-bench` synthesizes a store and times what the launch path calls.

@@ -708,6 +708,13 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Full-text search over the WHOLE store, which is what the history filter
+    /// needs — `recent` holds only the newest rows, so filtering it in memory
+    /// would search a shrinking fraction of a history that is never pruned.
+    func searchConversations(_ query: String, limit: Int) -> [ConversationMeta] {
+        ConversationStore.search(query, limit: limit)
+    }
+
     func newChat() {
         stop()
         persist()

@@ -59,7 +59,11 @@ struct ConversationMeta: Identifiable, Equatable {
 /// cannot leave a fork orphaned halfway through.
 ///
 /// Nothing is ever deleted to make room. The history popover asks for the rows
-/// it wants with a LIMIT; the store does not prune itself behind the user's back.
+/// it wants with a LIMIT; the store does not prune itself behind the user's
+/// back. Because the store therefore grows without bound, finding an old
+/// conversation cannot mean scanning the page currently on screen — a third
+/// table, `conversations_fts`, indexes transcript text so the popover's filter
+/// searches everything held rather than everything loaded.
 enum ConversationStore {
     /// How many conversations the history popover asks for by default. A read
     /// limit, not a storage cap — raising it costs one query, not a migration.
@@ -126,10 +130,14 @@ enum ConversationStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int32 = 1
+    private static let schemaVersion: Int32 = 2
 
     private static func migrate(_ database: SQLiteDatabase) throws {
-        guard database.userVersion < schemaVersion else { return }
+        if database.userVersion < 1 { try createBaseSchema(database) }
+        if database.userVersion < 2 { try addSearchIndex(database) }
+    }
+
+    private static func createBaseSchema(_ database: SQLiteDatabase) throws {
         try database.transaction {
             try database.execute(
                 """
@@ -174,8 +182,89 @@ enum ConversationStore {
                 );
                 """
             )
-            try database.setUserVersion(schemaVersion)
+            try database.setUserVersion(1)
         }
+    }
+
+    /// Full-text index over conversation text.
+    ///
+    /// The history filter used to match against the newest 50 rows' title and
+    /// 120-character snippet. That was complete only while the store was capped
+    /// at 50 — once nothing is pruned, filtering the visible slice searches a
+    /// shrinking fraction of a history that keeps growing, and never looks
+    /// inside a message at all.
+    ///
+    /// What gets indexed is the RESOLVED transcript, so a fork is findable by
+    /// the text it inherits and displays. Only user and assistant text goes in:
+    /// error and activity rows are UI furniture ("Forked here — this branch
+    /// diverges…"), and indexing them would make every fork a hit for "forked".
+    private static func addSearchIndex(_ database: SQLiteDatabase) throws {
+        try database.transaction {
+            try database.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
+                    title,
+                    body,
+                    -- Matches what in-conversation ⌘F already does
+                    -- (`.diacriticInsensitive`), so the two searches agree on
+                    -- what counts as the same word.
+                    tokenize = "unicode61 remove_diacritics 2"
+                );
+
+                -- Retracting the index entry belongs in a trigger, not at the
+                -- call sites: deletes arrive from an explicit delete AND from
+                -- the fork-materialization path, and an index that silently
+                -- keeps returning deleted conversations fails in the direction
+                -- nobody checks.
+                CREATE TRIGGER IF NOT EXISTS conversations_fts_delete
+                AFTER DELETE ON conversations BEGIN
+                    DELETE FROM conversations_fts WHERE rowid = old.rowid;
+                END;
+                """
+            )
+
+            // Backfill whatever the store already holds.
+            let ids = try database.prepare("SELECT id FROM conversations")
+            var existing: [UUID] = []
+            try ids.forEachRow { row in
+                if let id = row.uuid(0) { existing.append(id) }
+            }
+            for id in existing {
+                guard let row = try storedRow(id: id, database: database) else { continue }
+                let (resolved, _) = try resolve(row, database: database, visited: [id])
+                try indexForSearch(id: id, title: row.title, resolved: resolved, database: database)
+            }
+            try database.setUserVersion(2)
+        }
+    }
+
+    private static func rowID(of id: UUID, database: SQLiteDatabase) throws -> Int? {
+        let statement = try database.prepare("SELECT rowid FROM conversations WHERE id = ?")
+        statement.bind(1, id)
+        guard try statement.step() else { return nil }
+        return statement.int(0)
+    }
+
+    private static func indexForSearch(
+        id: UUID,
+        title: String,
+        resolved: [(owner: UUID, message: StoredMessage)],
+        database: SQLiteDatabase
+    ) throws {
+        guard let rowID = try rowID(of: id, database: database) else { return }
+        let delete = try database.prepare("DELETE FROM conversations_fts WHERE rowid = ?")
+        delete.bind(1, rowID)
+        try delete.run()
+
+        let body = resolved
+            .filter { $0.message.role == .user || $0.message.role == .assistant }
+            .map { $0.message.text }
+            .joined(separator: "\n")
+        let insert = try database.prepare(
+            "INSERT INTO conversations_fts(rowid, title, body) VALUES (?, ?, ?)"
+        )
+        insert.bind(1, rowID).bind(2, title).bind(3, body)
+        try insert.run()
     }
 
     // MARK: - Stored representation
@@ -429,11 +518,30 @@ enum ConversationStore {
             .bind(10, json)
         try upsert.run()
 
-        // Replace rather than merge: a message can lose an attachment, and the
-        // conversation's own messages are the whole truth about what it owns.
-        let clear = try database.prepare("DELETE FROM attachments WHERE conversation_id = ?")
-        clear.bind(1, conversation.id)
-        try clear.run()
+        // Reconcile WHICH attachments belong to this conversation rather than
+        // rewriting all of them. An Attachment is immutable once built — its
+        // `content` is a `let`, and nothing mutates `note`/`noteKind` after
+        // construction — so a row that is still referenced is still correct.
+        // Rewriting every blob on each persisted turn cost ~27 ms and re-wrote
+        // the conversation's whole image payload every time a message landed.
+        var alreadyStored: Set<UUID> = []
+        let existing = try database.prepare(
+            "SELECT attachment_id FROM attachments WHERE conversation_id = ?"
+        )
+        existing.bind(1, conversation.id)
+        try existing.forEachRow { row in
+            if let attachmentID = row.uuid(0) { alreadyStored.insert(attachmentID) }
+        }
+        let current = Set(conversation.messages.flatMap { $0.attachments.map(\.id) })
+
+        let delete = try database.prepare(
+            "DELETE FROM attachments WHERE conversation_id = ? AND attachment_id = ?"
+        )
+        for removed in alreadyStored.subtracting(current) {
+            delete.bind(1, conversation.id).bind(2, removed)
+            try delete.run()
+            delete.reset()
+        }
 
         let insert = try database.prepare(
             """
@@ -444,7 +552,7 @@ enum ConversationStore {
             """
         )
         for message in conversation.messages {
-            for attachment in message.attachments {
+            for attachment in message.attachments where !alreadyStored.contains(attachment.id) {
                 let payload = columns(for: attachment.content)
                 insert.bind(1, conversation.id)
                     .bind(2, attachment.id)
@@ -460,6 +568,10 @@ enum ConversationStore {
                 insert.reset()
             }
         }
+
+        try indexForSearch(
+            id: conversation.id, title: conversation.title, resolved: resolved, database: database
+        )
 
         // The created_at that actually landed — an update kept the stored one.
         let createdAt = try storedRow(id: conversation.id, database: database)?.createdAt ?? row.createdAt
@@ -603,6 +715,82 @@ enum ConversationStore {
                     createdAt: row.date(2) ?? Date(),
                     updatedAt: row.date(3) ?? Date(),
                     snippet: row.string(4) ?? "",
+                    messageCount: row.int(5) ?? 0,
+                    attachmentCount: row.int(6) ?? 0,
+                    isFork: row.uuid(7) != nil
+                ))
+            }
+            return result
+        } ?? []
+    }
+
+    // MARK: - Search
+
+    /// Turns what the user typed into an FTS5 MATCH expression.
+    ///
+    /// Splitting on everything that is not a letter or digit is the safety
+    /// property, not a nicety: FTS5's own syntax (`"`, `*`, `:`, `^`, `NEAR`,
+    /// `AND`) then never reaches the parser, so an apostrophe in "don't" is a
+    /// word boundary rather than a syntax error that fails the whole query.
+    /// Quoting each term makes the operator words literal too. The last term is
+    /// prefix-matched so results narrow while the user is still typing.
+    static func matchExpression(for input: String) -> String? {
+        let terms = input.split { !$0.isLetter && !$0.isNumber }
+        guard !terms.isEmpty else { return nil }
+        return terms.enumerated()
+            .map { index, term in index == terms.count - 1 ? "\"\(term)\"*" : "\"\(term)\"" }
+            .joined(separator: " ")
+    }
+
+    /// Full-text search across every stored conversation.
+    ///
+    /// The result is the best `limit` matches by relevance, handed back newest
+    /// first. Both halves of that are deliberate.
+    ///
+    /// Selecting by bm25 rank and only then sorting by date is what keeps the
+    /// cost bounded. Sorting all matches by date instead means the work scales
+    /// with how many conversations match, and a broad query matches nearly
+    /// everything: on a 10,000-conversation store a term present in every
+    /// conversation took 1,060 ms that way versus 13 ms this way. Search runs
+    /// on each keystroke, and the FIRST keystroke is always the broadest query
+    /// the user will type, so the worst case is the common case.
+    ///
+    /// Displaying that set newest-first rather than in rank order is for the
+    /// popover, which groups rows under day headers — rank order would
+    /// interleave dates and repeat the headers.
+    static func search(_ query: String, limit: Int = defaultRecentLimit) -> [ConversationMeta] {
+        guard let match = matchExpression(for: query) else { return [] }
+        return perform("search") { database in
+            let statement = try database.prepare(
+                """
+                SELECT c.id, c.title, c.created_at, c.updated_at, c.snippet,
+                       c.message_count, c.attachment_count, c.parent_id, m.excerpt
+                FROM (
+                    SELECT rowid,
+                           snippet(conversations_fts, -1, '', '', '…', 12) AS excerpt
+                    FROM conversations_fts
+                    WHERE conversations_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                ) m
+                JOIN conversations c ON c.rowid = m.rowid
+                ORDER BY c.updated_at DESC
+                """
+            )
+            statement.bind(1, match).bind(2, limit)
+            var result: [ConversationMeta] = []
+            try statement.forEachRow { row in
+                guard let id = row.uuid(0) else { return }
+                let matched = row.string(8) ?? ""
+                result.append(ConversationMeta(
+                    id: id,
+                    title: row.string(1) ?? "",
+                    createdAt: row.date(2) ?? Date(),
+                    updatedAt: row.date(3) ?? Date(),
+                    // Show text around the hit, so a row never appears with a
+                    // preview that does not contain what was searched for.
+                    // A title-only match has no body snippet; fall back then.
+                    snippet: matched.isEmpty ? (row.string(4) ?? "") : matched,
                     messageCount: row.int(5) ?? 0,
                     attachmentCount: row.int(6) ?? 0,
                     isFork: row.uuid(7) != nil
