@@ -30,7 +30,15 @@ POPCHAT_API_KEY=… .build/debug/PopChat --smoke-search       # tool-calling loo
 .build/debug/PopChat --smoke-typing                         # composer latency budget
 .build/debug/PopChat --smoke-scroll                         # transcript scroll perf
 .build/debug/PopChat --smoke-find                           # find-in-chat behavior
+.build/debug/PopChat --smoke-history-bench [convs] [images] # conversation-store startup cost
 ```
+
+`--smoke-history-bench` synthesizes a store and times what the launch path calls.
+Listing history must stay flat as the store grows: it reads metadata columns only,
+so neither message bodies nor attachment blobs are on that path. If it starts
+tracking store size again, something has put a body back into the list query.
+Set `POPCHAT_BENCH_DIR` to keep the generated store — measuring in the same
+process that just bulk-inserted it measures a hot write-ahead log, not a launch.
 
 ```sh
 dist/PopChat.app/Contents/MacOS/PopChat --smoke-bundles     # packaging: dependency resources resolve

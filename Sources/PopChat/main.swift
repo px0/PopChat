@@ -588,6 +588,138 @@ if CommandLine.arguments.contains("--smoke-persist") {
     let materialized = ConversationStore.load(id: child.id)
     print("afterParentDelete standalone=\(materialized?.parentID == nil) messages=\(materialized?.messages.count ?? -1)")
     ConversationStore.delete(id: child.id)
+
+    // Attachment payloads round-trip through BLOB storage. This is the part the
+    // SQLite store rewrites most: data URLs are split into media type + decoded
+    // bytes on the way in and rebuilt on the way out, so "byte-identical" is the
+    // only acceptable result. Runs against a scratch store — these payloads are
+    // synthetic and have no business in the user's history.
+    let scratch = FileManager.default.temporaryDirectory
+        .appendingPathComponent("popchat-attach-roundtrip-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    ConversationStore.overrideDirectory = scratch
+
+    let imageURL = "data:image/jpeg;base64," + Data((0..<4096).map { UInt8($0 % 251) }).base64EncodedString()
+    let pdfURL = "data:application/pdf;base64," + Data((0..<8192).map { UInt8($0 % 253) }).base64EncodedString()
+    let attachments = [
+        Attachment(filename: "shot.jpg", content: .image(dataURL: imageURL), note: "downscaled", noteKind: .info),
+        Attachment(filename: "paper.pdf", content: .pdf(dataURL: pdfURL, extractedText: "extracted body"), note: nil),
+        Attachment(filename: "notes.txt", content: .text("plain text payload"), note: nil),
+    ]
+    let withFiles = Conversation(
+        id: UUID(), title: "Attachments", updatedAt: Date(),
+        messages: [ChatMessage(role: .user, text: "see attached", attachments: attachments)]
+    )
+    ConversationStore.save(withFiles)
+    let readBack = ConversationStore.load(id: withFiles.id)?.messages.first?.attachments ?? []
+    print("attachments stored=\(attachments.count) readBack=\(readBack.count) identical=\(readBack == attachments)")
+
+    // A fork inherits the prefix's attachments; materializing it when the parent
+    // is deleted must carry those payloads into the child's own rows, or the
+    // transcript survives with its images gone.
+    let forkTip = ChatMessage(role: .user, text: "with image", attachments: [attachments[0]])
+    let attachParent = Conversation(
+        id: UUID(), title: "Attach parent", updatedAt: Date(), messages: [forkTip]
+    )
+    let attachChild = Conversation(
+        id: UUID(), title: "Attach child", updatedAt: Date(),
+        messages: [ChatMessage(role: .assistant, text: "diverged")],
+        parentID: attachParent.id, forkMessageID: forkTip.id
+    )
+    ConversationStore.save(attachParent)
+    ConversationStore.save(attachChild)
+    ConversationStore.deleteMaterializingChildren(id: attachParent.id)
+    let inherited = ConversationStore.load(id: attachChild.id)?.messages.first?.attachments ?? []
+    print("forkInheritedAttachments=\(inherited.count) identical=\(inherited == [attachments[0]])")
+
+    // Nothing is pruned to make room any more: storing past the display limit
+    // must leave every row in place, with the limit applied only by the query.
+    for index in 0..<(ConversationStore.defaultRecentLimit + 5) {
+        ConversationStore.save(Conversation(
+            id: UUID(), title: "bulk \(index)",
+            updatedAt: Date().addingTimeInterval(Double(index)),
+            messages: [ChatMessage(role: .user, text: "bulk \(index)")]
+        ))
+    }
+    print("storedTotal=\(ConversationStore.count()) listedDefault=\(ConversationStore.listRecent().count) listedAll=\(ConversationStore.listRecent(limit: 1000).count)")
+
+    // Deleting a conversation must take its attachment blobs with it. That is a
+    // foreign-key cascade, and SQLite leaves foreign keys OFF unless a PRAGMA
+    // turns them on PER CONNECTION — so a dropped pragma would silently leak
+    // every image the user ever deleted, with nothing visibly broken.
+    ConversationStore.delete(id: withFiles.id)
+    ConversationStore.delete(id: attachChild.id)
+    print("afterDeletingAttachmentOwners orphanBlobs=\(ConversationStore.orphanAttachmentCount())")
+
+    try? FileManager.default.removeItem(at: scratch)
+    exit(0)
+}
+
+// Startup-cost benchmark for the conversation store (no network, no UI):
+//   .build/debug/PopChat --smoke-history-bench [conversations] [imagesPerConv]
+// Synthesizes a worst-case store in a scratch directory and times the call the
+// app makes on the launch path, so the cost of listing history is measured
+// rather than assumed.
+if CommandLine.arguments.contains("--smoke-history-bench") {
+    let args = CommandLine.arguments
+    let index = args.firstIndex(of: "--smoke-history-bench")!
+    let count = args.count > index + 1 ? Int(args[index + 1]) ?? 50 : 50
+    let imagesPer = args.count > index + 2 ? Int(args[index + 2]) ?? 1 : 1
+
+    // POPCHAT_BENCH_DIR keeps the generated store on disk (and reuses it if it
+    // already has rows), so a second run measures a settled database rather than
+    // one whose write-ahead log is still hot from the bulk insert.
+    let keptDirectory = ProcessInfo.processInfo.environment["POPCHAT_BENCH_DIR"].map { URL(fileURLWithPath: $0) }
+    let scratch = keptDirectory ?? FileManager.default.temporaryDirectory
+        .appendingPathComponent("popchat-histbench-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    ConversationStore.overrideDirectory = scratch
+    let alreadyPopulated = ConversationStore.count() >= count
+
+    // A 2048px-edge JPEG at quality 0.8 base64s to roughly this much; the point
+    // of the benchmark is that this payload is read and decoded at launch purely
+    // to produce a 120-character snippet.
+    let fakeImage = "data:image/jpeg;base64," + String(repeating: "A", count: 900_000)
+    let prose = String(repeating: "Prose that makes the transcript realistically long. ", count: 40)
+
+    for conversationIndex in 0..<(alreadyPopulated ? 0 : count) {
+        var messages: [ChatMessage] = []
+        for messageIndex in 0..<20 {
+            let attachments = (messageIndex == 0 ? (0..<imagesPer) : (0..<0)).map { imageIndex in
+                Attachment(
+                    filename: "shot-\(imageIndex).jpg",
+                    content: .image(dataURL: fakeImage),
+                    note: nil
+                )
+            }
+            messages.append(ChatMessage(
+                role: messageIndex % 2 == 0 ? .user : .assistant,
+                text: "message \(messageIndex) of conversation \(conversationIndex). \(prose)",
+                attachments: attachments
+            ))
+        }
+        ConversationStore.save(Conversation(
+            id: UUID(),
+            title: "bench \(conversationIndex)",
+            updatedAt: Date().addingTimeInterval(Double(-conversationIndex)),
+            messages: messages
+        ))
+    }
+
+    let bytes = (try? FileManager.default.contentsOfDirectory(at: scratch, includingPropertiesForKeys: [.fileSizeKey]))?
+        .reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) } ?? 0
+
+    let start = DispatchTime.now()
+    let list = ConversationStore.listRecent()
+    let listMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+
+    // The other half of the launch path: resuming the newest conversation.
+    let resumeStart = DispatchTime.now()
+    let resumed = list.first.flatMap { ConversationStore.loadResolved(id: $0.id) }
+    let resumeMs = Double(DispatchTime.now().uptimeNanoseconds - resumeStart.uptimeNanoseconds) / 1_000_000
+
+    print("conversations=\(count) imagesPerConv=\(imagesPer) storeBytes=\(bytes) (\(bytes / 1_048_576) MB)")
+    print(String(format: "listRecent=%.1fms loadResolved=%.1fms listed=%d stored=%d resumedMessages=%d",
+                 listMs, resumeMs, list.count, ConversationStore.count(), resumed?.messages.count ?? -1))
+    if keptDirectory == nil { try? FileManager.default.removeItem(at: scratch) }
     exit(0)
 }
 

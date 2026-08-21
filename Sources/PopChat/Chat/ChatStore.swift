@@ -730,29 +730,25 @@ final class ChatStore: ObservableObject {
         adopt(loaded)
     }
 
-    /// Writes the current conversation to disk (a fork stores only its
+    /// Writes the current conversation to the store (a fork stores only its
     /// divergent tail) and refreshes its slot in the recent list. No-op for
-    /// empty conversations (avoids junk files).
+    /// empty conversations (avoids junk rows).
     private func persist() {
         guard !messages.isEmpty else { return }
-        let title = Self.title(for: messages)
         let conversation = Conversation(
             id: conversationID,
-            title: title,
+            title: Self.title(for: messages),
             updatedAt: Date(),
             messages: Array(messages.dropFirst(sharedPrefixCount)),
             parentID: forkParentID,
             forkMessageID: forkMessageID
         )
-        ConversationStore.save(conversation)
+        // The store hands back the row it actually wrote: a snippet and counts
+        // derived from the RESOLVED fork chain, and the created_at it preserved.
+        // Recomputing any of that here would be a second, drifting definition.
+        guard let meta = ConversationStore.save(conversation) else { return }
         recent.removeAll { $0.id == conversationID }
-        recent.insert(ConversationMeta(
-            id: conversationID,
-            title: title,
-            updatedAt: conversation.updatedAt,
-            snippet: ConversationMeta.snippet(for: messages),
-            isFork: forkParentID != nil
-        ), at: 0)
+        recent.insert(meta, at: 0)
     }
 
     private static func title(for messages: [ChatMessage]) -> String {

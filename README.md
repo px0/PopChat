@@ -59,9 +59,11 @@ Local models need no key at all: run Ollama and pick its preset, or point a cust
 | --- | --- |
 | Providers, models, preferences | `UserDefaults` (`com.chenle.PopChat`) |
 | API keys & OAuth tokens | `~/Library/Application Support/PopChat/secrets.json` (chmod 600) |
-| Conversations | `~/Library/Application Support/PopChat/conversations/*.json` |
+| Conversations | `~/Library/Application Support/PopChat/conversations/conversations.sqlite` |
 
 Secrets are a plain JSON file, not the Keychain: with ad-hoc signing every rebuild changes the binary identity, and macOS would then demand the login-keychain password on every launch. The file matches the trust model of the `.env` the keys usually come from.
+
+Conversations are kept indefinitely — nothing is deleted to make room, and the history popover simply asks for the newest 50. Versions before 0.1.3 stored one JSON file per conversation and are not carried over; those files are left where they are, and a fresh database starts empty.
 
 ## Keyboard shortcuts
 
