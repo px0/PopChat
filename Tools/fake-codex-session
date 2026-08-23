@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Fake `codex app-server` for the session-reuse harnesses.
+
+Unlike the other fakes, this one is written to survive MANY turns — that is the
+behaviour under test. It records every protocol method it receives, one per
+line, to $POPCHAT_FAKE_LOG, prefixed by the pid so a smoke can tell "two turns
+on one process" from "two processes". A `spawn` line is written at startup.
+
+$POPCHAT_FAKE_MODE selects the scenario:
+  normal        answer every turn immediately (default)
+  interrupt     stream a delta, then wait for turn/interrupt and complete the
+                turn as `interrupted` ~200 ms later — the window in which a
+                stale cancellation timer would kill a process that has already
+                moved on to the next turn
+  wedge-setup   never answer `initialize`, so a cancel lands during setup where
+                there is no turn id to interrupt
+  no-turn-id    like `normal`, but omits turnId/turn.id everywhere: an older
+                app-server, against which strict turn filtering would silently
+                drop every delta
+"""
+import json
+import os
+import sys
+import threading
+import time
+
+MODE = os.environ.get("POPCHAT_FAKE_MODE", "normal")
+LOG = os.environ.get("POPCHAT_FAKE_LOG")
+PID = os.getpid()
+WITH_TURN_ID = MODE != "no-turn-id"
+
+_out = threading.Lock()
+
+
+def record(event):
+    if not LOG:
+        return
+    with open(LOG, "a") as handle:
+        handle.write(f"{PID} {event}\n")
+
+
+def send(obj):
+    with _out:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def notify(method, params):
+    send({"method": method, "params": params})
+
+
+def turn_fields(turn_id):
+    return {"threadId": "t1", "turnId": turn_id} if WITH_TURN_ID else {"threadId": "t1"}
+
+
+def answer(turn_id, text):
+    if WITH_TURN_ID:
+        notify("turn/started", {"threadId": "t1", "turn": {"id": turn_id}})
+    fields = turn_fields(turn_id)
+    notify("item/agentMessage/delta", {**fields, "itemId": f"{turn_id}-m1", "delta": text})
+    notify("item/completed", {**fields, "item": {
+        "type": "agentMessage", "id": f"{turn_id}-m1", "text": text}})
+    notify("turn/completed", {"threadId": "t1", "turn": {"id": turn_id, "status": "completed"}})
+
+
+record("spawn")
+turn_index = 0
+pending_interrupt = None
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method, mid = msg.get("method"), msg.get("id")
+    record(method)
+
+    if method == "initialize":
+        if MODE == "wedge-setup":
+            continue          # never answers; the adapter is stuck in setup
+        send({"id": mid, "result": {}})
+    elif method == "initialized":
+        pass
+    elif method == "account/read":
+        send({"id": mid, "result": {"account": {
+            "type": "chatgpt", "email": "fake@example.test", "planType": "test"}}})
+    elif method == "thread/start":
+        send({"id": mid, "result": {"thread": {"id": "t1"}}})
+    elif method == "thread/inject_items":
+        send({"id": mid, "result": {}})
+    elif method == "turn/start":
+        turn_index += 1
+        turn_id = f"u{turn_index}"
+        send({"id": mid, "result": {"turn": {"id": turn_id}}})
+        if MODE == "interrupt" and turn_index == 1:
+            # Stream something, then hold the turn open until interrupted.
+            if WITH_TURN_ID:
+                notify("turn/started", {"threadId": "t1", "turn": {"id": turn_id}})
+            notify("item/agentMessage/delta", {
+                **turn_fields(turn_id), "itemId": "m1", "delta": "partial"})
+            pending_interrupt = turn_id
+        elif MODE == "interrupt" and turn_index == 2:
+            # Deliberately still in flight when the CANCELLED turn's 1 s
+            # fallback timer fires. Without an epoch guard on that timer, this
+            # turn's process is killed underneath it and the answer never
+            # arrives — which is the whole point of this scenario.
+            def answer_later(turn_id=turn_id, index=turn_index):
+                time.sleep(1.2)
+                answer(turn_id, f"answer{index}")
+
+            threading.Thread(target=answer_later, daemon=True).start()
+        else:
+            answer(turn_id, f"answer{turn_index}")
+    elif method == "turn/interrupt":
+        target = msg.get("params", {}).get("turnId", pending_interrupt)
+        send({"id": mid, "result": {}})
+
+        def finish(turn_id=target):
+            # Deliberately slower than an instant reply and well inside the
+            # adapter's 1 s grace: a follow-up turn sent in the remaining window
+            # must not be killed by this turn's cancellation timer.
+            time.sleep(0.2)
+            notify("turn/completed", {
+                "threadId": "t1", "turn": {"id": turn_id, "status": "interrupted"}})
+
+        threading.Thread(target=finish, daemon=True).start()
+        pending_interrupt = None
+    elif mid is not None:
+        send({"id": mid, "result": {}})

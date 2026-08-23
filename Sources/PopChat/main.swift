@@ -538,6 +538,246 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-bac
     RunLoop.main.run()
 }
 
+// Session-reuse laws for the Codex app-server backend, against a fake that
+// survives many turns and records every method it receives:
+//   .build/debug/PopChat --smoke-codex-app-server-session /path/to/fake-codex-session
+//
+// What each case pins down, and what breaks if it regresses:
+// A. A follow-up turn REUSES the live thread — one process, one thread/start,
+//    no re-injection. Losing this is losing the prompt cache (measured: 11,008
+//    of 11,635 input tokens cached on a reused thread, 0 on a fresh one), and
+//    it is invisible from the outside, which is why it is asserted here.
+// B. A delivered message that no longer matches the transcript forces a new
+//    THREAD but keeps the process. This is the safety property: the store is
+//    authoritative and a thread that disagrees with it is thrown away.
+// C. Toggling Codex's own web_search forces a new PROCESS, because it is a
+//    launch argument rather than a turn parameter.
+// D. An app-server that omits turnId must still stream — the filter is
+//    presence-gated, and a strict one would render empty replies.
+// E. A cancelled turn is interrupted rather than killed, and the follow-up turn
+//    that starts inside the cancellation's 1 s grace must NOT be killed by that
+//    stale timer. The fake holds turn 2 open past the grace so a missing epoch
+//    guard fails here instead of in the wild.
+if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-session"),
+   CommandLine.arguments.count > flag + 1 {
+    let executable = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    Task {
+        let config = ProviderConfig(baseURL: "", apiKey: "", model: "fake-model", kind: .codexAppServer)
+        func user(_ text: String) -> OpenAIChatClient.WireMessage {
+            OpenAIChatClient.WireMessage(role: "user", content: .text(text))
+        }
+        func assistant(_ text: String) -> OpenAIChatClient.WireMessage {
+            OpenAIChatClient.WireMessage(role: "assistant", content: .text(text))
+        }
+        let system = OpenAIChatClient.WireMessage(role: "system", content: .text("system prompt"))
+
+        struct Tally {
+            var processes = 0
+            var threadStarts = 0
+            var injects = 0
+            var turnStarts = 0
+            var interrupts = 0
+        }
+
+        var caseIndex = 0
+        func newLog(_ mode: String) -> String {
+            caseIndex += 1
+            let path = NSTemporaryDirectory()
+                .appending("popchat-fake-session-\(ProcessInfo.processInfo.processIdentifier)-\(caseIndex).log")
+            try? FileManager.default.removeItem(atPath: path)
+            setenv("POPCHAT_FAKE_LOG", path, 1)
+            setenv("POPCHAT_FAKE_MODE", mode, 1)
+            return path
+        }
+        func tally(_ path: String) -> Tally {
+            let text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+            var result = Tally()
+            var pids = Set<Substring>()
+            for line in text.split(separator: "\n") {
+                let parts = line.split(separator: " ", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                pids.insert(parts[0])
+                switch parts[1] {
+                case "thread/start": result.threadStarts += 1
+                case "thread/inject_items": result.injects += 1
+                case "turn/start": result.turnStarts += 1
+                case "turn/interrupt": result.interrupts += 1
+                default: break
+                }
+            }
+            result.processes = pids.count
+            return result
+        }
+
+        @discardableResult
+        func run(
+            _ backend: CodexAppServerBackend,
+            _ transcript: [OpenAIChatClient.WireMessage],
+            webSearch: Bool = false,
+            cancelAfterPartial: Bool = false
+        ) async -> String {
+            var text = ""
+            let turn = ChatTurn(
+                transcript: transcript, config: config, webAccess: nil, codexWebSearch: webSearch
+            )
+            var cancelled = false
+            for await event in backend.stream(turn) {
+                switch event {
+                case .partial(let value), .done(let value):
+                    text = value
+                    if cancelAfterPartial, !cancelled, !value.isEmpty {
+                        cancelled = true
+                        backend.cancelTurn()
+                    }
+                case .error(let message):
+                    text = "ERROR: \(message)"
+                default:
+                    break
+                }
+            }
+            return text
+        }
+
+        var failures: [String] = []
+        func expect(_ condition: Bool, _ description: String) {
+            if !condition { failures.append(description) }
+        }
+
+        // A + B + C share one backend: they are a sequence of turns on one
+        // conversation, which is exactly the lifetime under test.
+        let logA = newLog("normal")
+        let backend = CodexAppServerBackend(executableOverride: executable, inactivityTimeout: 10)
+        let a1 = await run(backend, [system, user("q1")])
+        let a2 = await run(backend, [system, user("q1"), assistant(a1), user("q2")])
+        let afterA = tally(logA)
+        expect(a1 == "answer1" && a2 == "answer2", "A: answers were \(a1)/\(a2)")
+        expect(afterA.processes == 1, "A: spawned \(afterA.processes) processes, expected 1")
+        expect(afterA.threadStarts == 1, "A: \(afterA.threadStarts) thread/start, expected 1")
+        expect(afterA.turnStarts == 2, "A: \(afterA.turnStarts) turn/start, expected 2")
+        expect(afterA.injects == 0, "A: re-injected \(afterA.injects) times, expected 0")
+
+        // B: the first message no longer matches what the thread was told.
+        let b = await run(backend, [system, user("MUTATED"), assistant(a1), user("q3")])
+        let afterB = tally(logA)
+        expect(b == "answer3", "B: answer was \(b)")
+        expect(afterB.processes == 1, "B: spawned a new process, expected the thread to be rebuilt in place")
+        expect(afterB.threadStarts == 2, "B: \(afterB.threadStarts) thread/start, expected 2")
+        expect(afterB.injects == 1, "B: \(afterB.injects) inject_items, expected 1")
+
+        // C: the globe is a launch argument.
+        let c = await run(backend, [system, user("MUTATED"), assistant(a1), user("q3"), assistant(b), user("q4")], webSearch: true)
+        let afterC = tally(logA)
+        expect(c == "answer1", "C: answer was \(c) (a fresh process restarts its turn counter)")
+        expect(afterC.processes == 2, "C: \(afterC.processes) processes, expected 2")
+        backend.discard()
+
+        // D: an app-server that never sends turnId.
+        let logD = newLog("no-turn-id")
+        let legacy = CodexAppServerBackend(executableOverride: executable, inactivityTimeout: 10)
+        let d1 = await run(legacy, [system, user("q1")])
+        let d2 = await run(legacy, [system, user("q1"), assistant(d1), user("q2")])
+        expect(d1 == "answer1" && d2 == "answer2", "D: answers were \(d1)/\(d2) — turn filtering dropped events")
+        expect(tally(logD).processes == 1, "D: reuse did not survive a turnId-less server")
+        legacy.discard()
+
+        // E: interrupt, then a follow-up inside the cancellation grace.
+        let logE = newLog("interrupt")
+        let cancelling = CodexAppServerBackend(executableOverride: executable, inactivityTimeout: 10)
+        let e1 = await run(cancelling, [system, user("q1")], cancelAfterPartial: true)
+        let e2 = await run(cancelling, [system, user("q1"), assistant("partial"), user("q2")])
+        let afterE = tally(logE)
+        expect(e1 == "partial", "E: interrupted turn kept \(e1)")
+        expect(afterE.interrupts == 1, "E: \(afterE.interrupts) turn/interrupt, expected 1")
+        expect(e2 == "answer2", "E: follow-up returned \(e2) — a stale cancellation timer killed a live turn")
+        expect(afterE.processes == 1, "E: \(afterE.processes) processes, expected the interrupt to spare the child")
+        cancelling.discard()
+
+        for failure in failures { print("FAIL: \(failure)") }
+        print("A=\(afterA) B=\(afterB) C=\(afterC) E=\(afterE)")
+        print(failures.isEmpty ? "PASS" : "FAIL")
+        exit(failures.isEmpty ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
+// LIVE proof that holding the thread open is worth what it costs — needs the
+// user's real Codex, signed in, and spends a little of their plan:
+//   .build/debug/PopChat --smoke-codex-app-server-cache
+//
+// Two turns through ONE backend, exactly as a conversation drives it. The claim
+// under test is not "it is faster" (wall-clock is noisy) but the number the
+// backend keeps working for: the second turn's input must come back mostly
+// CACHED. Measured while building this: 0 cached across fresh threads, ~95%
+// cached on a reused one.
+if CommandLine.arguments.contains("--smoke-codex-app-server-cache") {
+    Task {
+        let model: String
+        do {
+            let inspection = try await CodexAppServerClient.inspect(includeModels: true)
+            model = inspection.defaultModel ?? inspection.models.first ?? ""
+        } catch {
+            print("CODEX-APP-SERVER-ERROR: \(error.localizedDescription)")
+            exit(1)
+        }
+        let config = ProviderConfig(baseURL: "", apiKey: "", model: model, kind: .codexAppServer)
+        let backend = CodexAppServerBackend()
+        func turn(_ transcript: [OpenAIChatClient.WireMessage]) async -> (text: String, ttft: TimeInterval) {
+            let started = Date()
+            var first: TimeInterval?
+            var text = ""
+            for await event in backend.stream(ChatTurn(
+                transcript: transcript, config: config, webAccess: nil, codexWebSearch: false
+            )) {
+                switch event {
+                case .partial(let value), .done(let value):
+                    if first == nil, !value.isEmpty { first = Date().timeIntervalSince(started) }
+                    text = value
+                case .error(let message):
+                    text = "ERROR: \(message)"
+                default:
+                    break
+                }
+            }
+            return (text, first ?? Date().timeIntervalSince(started))
+        }
+
+        let system = OpenAIChatClient.WireMessage(
+            role: "system", content: .text(ChatStore.defaultSystemPrompt)
+        )
+        // Long enough to clear the backend's minimum cacheable prefix comfortably.
+        let ballast = (1...120)
+            .map { "Fact \($0): widget \($0) weighs \($0 * 3) grams and ships from depot \($0 % 7)." }
+            .joined(separator: " ")
+        let first = OpenAIChatClient.WireMessage(
+            role: "user", content: .text("Keep this in mind. \(ballast)\n\nHow much does widget 5 weigh? One short sentence.")
+        )
+        let one = await turn([system, first])
+        let usageOne = backend.tokenUsage
+        let two = await turn([
+            system, first,
+            OpenAIChatClient.WireMessage(role: "assistant", content: .text(one.text)),
+            OpenAIChatClient.WireMessage(role: "user", content: .text("Which depot ships widget 9? One short sentence.")),
+        ])
+        let usageTwo = backend.tokenUsage
+        backend.discard()
+
+        func describe(_ usage: CodexAppServerBackend.TokenUsage?) -> String {
+            guard let usage else { return "no usage reported" }
+            return "input=\(usage.input) cached=\(usage.cached)"
+        }
+        print(String(format: "turn1 ttft=%.2fs %@ text=%@", one.ttft, describe(usageOne), one.text.prefix(60) as CVarArg))
+        print(String(format: "turn2 ttft=%.2fs %@ text=%@", two.ttft, describe(usageTwo), two.text.prefix(60) as CVarArg))
+
+        // Turn 1 cannot be cached (nothing has been sent yet); turn 2 must be,
+        // and by most of its input rather than a token or two.
+        let passed = !one.text.hasPrefix("ERROR") && !two.text.hasPrefix("ERROR")
+            && (usageTwo.map { $0.input > 0 && $0.cached * 2 > $0.input } ?? false)
+        print(passed ? "PASS" : "FAIL")
+        exit(passed ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
 // ChatGPT-subscription auth + streaming checks (no UI):
 //   .build/debug/PopChat --chatgpt-login    interactive: opens the browser OAuth flow
 //   .build/debug/PopChat --smoke-chatgpt    requires a prior login; one streaming turn

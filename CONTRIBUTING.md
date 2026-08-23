@@ -47,15 +47,20 @@ dist/PopChat.app/Contents/MacOS/PopChat --smoke-bundles     # packaging: depende
 
 `--smoke-persist`, `--smoke-history`, `--smoke-minsize`, `--smoke-pasteable`, `--smoke-providers`, `--smoke-accent`, `--smoke-typewriter`, `--smoke-ephemeral`, `--chatgpt-login` and `--smoke-chatgpt` cover the rest. `--check-codex-app-server` checks the installed Codex, ChatGPT login and available model catalog without starting a model turn; `--smoke-codex-refresh-coalescing` verifies overlapping checks share one process. `--shot <settings|general|switcher> <path> [--dark|--light]` renders a view to PNG in-process.
 
-Three harnesses drive a fake app-server instead of the real one, so they cost no subscription quota and need no Codex install:
+Four harnesses drive a fake app-server instead of the real one, so they cost no subscription quota and need no Codex install:
 
 ```sh
 .build/debug/PopChat --smoke-codex-app-server-streaming    Tools/fake-codex-stream
 .build/debug/PopChat --smoke-codex-app-server-timeout      Tools/fake-codex-stall
 .build/debug/PopChat --smoke-codex-app-server-backpressure Tools/fake-codex-wedge
+.build/debug/PopChat --smoke-codex-app-server-session      Tools/fake-codex-session
 ```
 
-They guard, in order: turn assembly and notification ordering (both agent messages must survive, the first delta must not wait on the `turn/start` response, a replayed `item/completed` must not duplicate its item, and a `willRetry` error must drop the aborted in-flight partial and surface a retry status rather than gluing the re-stream onto it in silence); recovery from a process that goes silent mid-turn; and the rule that a process which stops draining its stdin cannot wedge PopChat — never hold a lock across the blocking write, or Stop and the watchdog both block behind it.
+They guard, in order: turn assembly and notification ordering (both agent messages must survive, the first delta must not wait on the `turn/start` response, a replayed `item/completed` must not duplicate its item, and a `willRetry` error must drop the aborted in-flight partial and surface a retry status rather than gluing the re-stream onto it in silence); recovery from a process that goes silent mid-turn; the rule that a process which stops draining its stdin cannot wedge PopChat — never hold a lock across the blocking write, or Stop and the watchdog both block behind it; and session reuse.
+
+That last one is worth explaining, because what it protects is invisible from the outside. `CodexAppServerBackend` keeps one `codex` process and one ephemeral thread alive across a conversation's turns, because the backend's prompt cache keys off the session: a reused thread reports most of its input cached, two fresh threads with an identical prefix report none. So a regression that quietly respawns per turn still produces correct answers — it just costs several times the tokens and seconds of extra latency, and no test that only reads the reply would notice. The harness counts protocol methods and pids instead: reuse sends one `thread/start` and no re-injection; a transcript that no longer matches what the thread was told rebuilds the thread but keeps the process; toggling web search (a launch argument) starts a new process; a `turnId`-less server must still stream; and a turn cancelled via `turn/interrupt` must leave the child alive without its cancellation timer killing the turn that follows.
+
+`--smoke-codex-app-server-cache` proves the same claim end to end against the real Codex, and prints the cached-token counts it asserts on. It costs a little quota, so it is not part of the routine loop.
 
 Two rules when running these:
 

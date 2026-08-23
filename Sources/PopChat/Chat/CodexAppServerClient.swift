@@ -326,6 +326,38 @@ enum CodexAppServerClient {
         )
     }
 
+    /// Replaces Codex's own base instructions — the coding-agent harness prompt
+    /// it prepends to every thread — with one that describes what PopChat
+    /// actually is.
+    ///
+    /// Measured on codex-cli 0.149.0 with PopChat's real developer
+    /// instructions: 9,176 → 5,640 input tokens with search off, 15,613 →
+    /// 12,081 with search on. That preamble is paid on EVERY turn, including a
+    /// two-line question, and it describes tools PopChat has already disabled at
+    /// launch (`--disable shell_tool` and siblings in Session.init).
+    ///
+    /// This is not a security control and must never be treated as one. The
+    /// containment is the disabled tools, `sandbox: read-only`,
+    /// `networkAccess: false` and `approvalPolicy: never`; removing Codex's
+    /// preamble removes a DESCRIPTION of capabilities that are already gone.
+    /// PopChat's own system prompt and sandbox boundary stay in
+    /// `developerInstructions`, so the split remains honest: this is the
+    /// harness, that is what the user asked for.
+    ///
+    /// Verified that Codex's native `web_search` still fires under it — the
+    /// tool is registered at launch, not described into existence here.
+    static let chatBaseInstructions = """
+    You are a helpful assistant answering in a small desktop chat panel. \
+    Prefer concise, well-formatted Markdown.
+    """
+
+    /// One-shot entry point: runs a single turn and tears the session down.
+    ///
+    /// Delegates to `CodexAppServerBackend` rather than duplicating the turn
+    /// loop, so the deterministic harnesses exercise the SAME code the app runs.
+    /// The app itself goes through the backend directly and keeps it alive
+    /// across a conversation's turns — which is the entire point, so anything
+    /// calling this instead is opting out of prompt caching.
     static func run(
         history: [OpenAIChatClient.WireMessage],
         config: ProviderConfig,
@@ -333,239 +365,71 @@ enum CodexAppServerClient {
         executableOverride: URL? = nil,
         inactivityTimeout: TimeInterval = 300
     ) -> AsyncStream<ChatStreamEvent> {
-        AsyncStream { continuation in
-            let holder = SessionHolder()
-            let effectiveTimeout = max(inactivityTimeout, 0.05)
-            let watchdog = InactivityWatchdog(timeout: effectiveTimeout) {
-                holder.stop()
-            }
-            // The entire JSONL transport is synchronous/blocking by design. Give
-            // each live turn a dedicated GCD queue rather than occupying a Swift
-            // concurrency cooperative-pool thread for the duration of the reply.
-            let queue = DispatchQueue(
-                label: "com.chenle.PopChat.codex-app-server.turn.\(UUID().uuidString)",
-                qos: .userInitiated
-            )
-            queue.async {
-                runTurn(
-                    history: history,
-                    config: config,
-                    webSearch: webSearch,
-                    executableOverride: executableOverride,
-                    inactivityTimeout: effectiveTimeout,
-                    holder: holder,
-                    watchdog: watchdog,
-                    continuation: continuation
-                )
-                watchdog.cancel()
-                holder.stop()
+        let backend = CodexAppServerBackend(
+            executableOverride: executableOverride,
+            inactivityTimeout: inactivityTimeout
+        )
+        let turn = ChatTurn(
+            transcript: history, config: config, webAccess: nil, codexWebSearch: webSearch
+        )
+        return AsyncStream { continuation in
+            let inner = backend.stream(turn)
+            let pump = Task {
+                for await event in inner { continuation.yield(event) }
+                backend.discard()
                 continuation.finish()
             }
             continuation.onTermination = { _ in
-                watchdog.cancel()
-                holder.stop()
+                pump.cancel()
+                backend.discard()
             }
         }
     }
 
-    private static func runTurn(
-        history: [OpenAIChatClient.WireMessage],
-        config: ProviderConfig,
-        webSearch: Bool,
-        executableOverride: URL?,
-        inactivityTimeout: TimeInterval,
-        holder: SessionHolder,
-        watchdog: InactivityWatchdog,
-        continuation: AsyncStream<ChatStreamEvent>.Continuation
-    ) {
-        do {
-            // A fresh child per turn means seconds of silence before the first
-            // token — say what is happening or the app reads as frozen. These
-            // are `.status` (transient, shown in the waiting row), not
-            // `.activity` (permanent transcript rows).
-            continuation.yield(.status("Starting Codex…"))
-            guard let executable = executableOverride ?? executableURL() else {
-                throw ClientError(message: missingMessage, reason: .missing)
-            }
-            try holder.checkCancellation()
-            let session = try Session(
-                executable: executable,
-                webSearch: webSearch,
-                onMessage: { watchdog.kick() }
-            )
-            holder.set(session)
-            defer { session.stop() }
-            // The watchdog's clock starts when it is CONSTRUCTED, which is before
-            // this queue was even scheduled and before the child was spawned.
-            // Resolving the executable and launching Codex (cold start, Gatekeeper
-            // scan on first run) is not the process being unresponsive — start
-            // measuring silence only now that it is actually up.
-            watchdog.kick()
-            try session.initialize()
-            _ = try readChatGPTAccount(session)
-            try holder.checkCancellation()
+    /// The thread-level instructions for a turn: PopChat's own system prompt,
+    /// then the boundary this provider is bound by.
+    ///
+    /// Says nothing about network when web search is on: the old blanket "no
+    /// tool network access" line reads as an instruction not to search, and the
+    /// model would obey it over the tool being present.
+    ///
+    /// A `thread/start` parameter, not a per-turn one — which is why a change
+    /// here has to invalidate a live thread (see `CodexAppServerBackend`).
+    fileprivate static func developerInstructions(
+        systemPrompt: String?, webSearch: Bool
+    ) -> String {
+        let boundary = webSearch
+            ? """
+            You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer from the conversation, using web search when the question needs current or external information. PopChat has started this thread with a read-only filesystem and no local tool network access.
+            """
+            : """
+            You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer directly from the conversation. PopChat has started this thread with read-only filesystem and no tool network access.
+            """
+        return [systemPrompt, boundary]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+    }
 
-            let split = try splitHistory(history)
-            let sandboxDirectory = try appServerWorkingDirectory()
-            // Say nothing about network when web search is on: the old blanket
-            // "no tool network access" line reads as an instruction not to
-            // search, and the model would obey it over the tool being present.
-            let boundary = webSearch
-                ? """
-                You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer from the conversation, using web search when the question needs current or external information. PopChat has started this thread with a read-only filesystem and no local tool network access.
-                """
-                : """
-                You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer directly from the conversation. PopChat has started this thread with read-only filesystem and no tool network access.
-                """
-            let developerInstructions = [split.systemPrompt, boundary]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
-
-            let threadResponse = try session.request(method: "thread/start", params: [
-                "approvalPolicy": .string("never"),
-                "cwd": .string(sandboxDirectory.path),
-                "developerInstructions": .string(developerInstructions),
-                "ephemeral": .bool(true),
-                "model": .string(config.model),
-                "sandbox": .string("read-only"),
-                "serviceName": .string("popchat"),
-            ])
-            let threadResult = try responseResult(threadResponse, method: "thread/start")
-            guard let threadID = threadResult["thread"]?.objectValue?["id"]?.stringValue else {
-                throw ClientError(message: "Codex app-server returned an invalid thread/start response.")
-            }
-
-            if !split.priorMessages.isEmpty {
-                let items = split.priorMessages.map(responseItem)
-                let injectResponse = try session.request(method: "thread/inject_items", params: [
-                    "threadId": .string(threadID),
-                    "items": .array(items),
-                ])
-                _ = try responseResult(injectResponse, method: "thread/inject_items")
-            }
-
-            var turnParams: JSONObject = [
-                "approvalPolicy": .string("never"),
-                "input": .array(turnInput(split.currentMessage)),
-                "model": .string(config.model),
-                "sandboxPolicy": .object([
-                    "type": .string("readOnly"),
-                    "networkAccess": .bool(false),
-                ]),
-                "threadId": .string(threadID),
-            ]
-            if let effort = config.reasoningEffort {
-                turnParams["effort"] = .string(effort)
-            }
-            // A turn can start emitting notifications before app-server writes the
-            // matching JSON-RPC response. Waiting through `request` would buffer
-            // those deltas and make the whole answer appear at once.
-            continuation.yield(.status("Waiting for \(config.model)…"))
-            let turnRequestID = try session.beginRequest(method: "turn/start", params: turnParams)
-            // A turn can produce SEVERAL agentMessage items (a preamble, then the
-            // answer), and the protocol keys every delta and completion by item
-            // id. `ItemAssembly` holds that shape; its doc comment carries the
-            // laws (authoritative idempotent completions, willRetry semantics).
-            var items = ItemAssembly()
-            var finished = false
-            while !finished, let message = try session.nextMessage() {
-                try holder.checkCancellation()
-                if message["id"]?.intValue == turnRequestID {
-                    _ = try responseResult(message, method: "turn/start")
-                    continue
-                }
-                guard let method = message["method"]?.stringValue,
-                      let params = message["params"]?.objectValue else { continue }
-                switch method {
-                case "item/agentMessage/delta":
-                    if let delta = params["delta"]?.stringValue {
-                        // `itemId` is required by the protocol; "" is a last-resort
-                        // key so a nonconforming server still streams.
-                        items.delta(id: params["itemId"]?.stringValue ?? "", text: delta)
-                        continuation.yield(.partial(items.snapshot))
-                    }
-                case "item/started":
-                    if let activity = activityLabel(item: params["item"]?.objectValue) {
-                        continuation.yield(.activity(activity))
-                    } else {
-                        switch params["item"]?.objectValue?["type"]?.stringValue {
-                        case "reasoning":
-                            // Reasoning items stream no visible text but can run
-                            // for a long time — the one signal that the model is
-                            // alive.
-                            continuation.yield(.status("Reasoning…"))
-                        case "webSearch":
-                            continuation.yield(.status("Searching the web…"))
-                        default:
-                            break
-                        }
-                    }
-                case "item/completed":
-                    guard let item = params["item"]?.objectValue else { continue }
-                    switch item["type"]?.stringValue {
-                    case "agentMessage":
-                        items.completed(
-                            id: item["id"]?.stringValue ?? "",
-                            text: item["text"]?.stringValue ?? ""
-                        )
-                        continuation.yield(.partial(items.snapshot))
-                    case "webSearch":
-                        continuation.yield(.activity(webSearchLabel(item)))
-                    default:
-                        break
-                    }
-                case "error":
-                    if params["willRetry"]?.boolValue == true {
-                        // Codex is about to re-deliver the aborted attempt, so an
-                        // in-flight partial would double up with the re-stream —
-                        // drop it, and say what the pause is instead of stalling
-                        // silently.
-                        if items.dropInFlight() {
-                            continuation.yield(.partial(items.snapshot))
-                        }
-                        continuation.yield(.status("Temporary error — Codex is retrying…"))
-                    } else if let message = params["error"]?.objectValue?["message"]?.stringValue {
-                        continuation.yield(.error(friendlyError(message)))
-                    }
-                case "turn/completed":
-                    let turn = params["turn"]?.objectValue
-                    let status = turn?["status"]?.stringValue ?? "failed"
-                    if status == "completed" || status == "interrupted" {
-                        continuation.yield(.done(items.snapshot))
-                    } else {
-                        let message = turn?["error"]?.objectValue?["message"]?.stringValue
-                            ?? "Codex app-server turn failed (status: \(status))."
-                        continuation.yield(.error(friendlyError(message)))
-                    }
-                    finished = true
-                default:
-                    continue
-                }
-            }
-            if !finished, watchdog.didTimeOut {
-                continuation.yield(.error(timeoutMessage(inactivityTimeout)))
-            } else if !finished, !holder.isStopped {
-                continuation.yield(.error("Codex app-server exited before the response completed. Update Codex and try again."))
-            }
-        } catch is CancellationError {
-            if watchdog.didTimeOut {
-                continuation.yield(.error(timeoutMessage(inactivityTimeout)))
-            }
-            return
-        } catch let error as ClientError {
-            if watchdog.didTimeOut {
-                continuation.yield(.error(timeoutMessage(inactivityTimeout)))
-            } else if !holder.isStopped {
-                continuation.yield(.error(error.message))
-            }
-        } catch {
-            if watchdog.didTimeOut {
-                continuation.yield(.error(timeoutMessage(inactivityTimeout)))
-            } else if !holder.isStopped {
-                continuation.yield(.error("Codex app-server failed: \(error.localizedDescription)"))
-            }
+    fileprivate static func threadStartParams(
+        developerInstructions: String,
+        model: String,
+        sandboxDirectory: URL,
+        withBaseInstructions: Bool
+    ) -> JSONObject {
+        var params: JSONObject = [
+            "approvalPolicy": .string("never"),
+            "cwd": .string(sandboxDirectory.path),
+            "developerInstructions": .string(developerInstructions),
+            "ephemeral": .bool(true),
+            "model": .string(model),
+            "sandbox": .string("read-only"),
+            "serviceName": .string("popchat"),
+        ]
+        if withBaseInstructions {
+            params["baseInstructions"] = .string(chatBaseInstructions)
         }
+        return params
     }
 
     /// Ordered assembly of one turn's agentMessage items.
@@ -626,7 +490,7 @@ enum CodexAppServerClient {
         }
     }
 
-    private static func timeoutMessage(_ seconds: TimeInterval) -> String {
+    fileprivate static func timeoutMessage(_ seconds: TimeInterval) -> String {
         let duration: String
         if seconds >= 60 {
             duration = "\(Int((seconds / 60).rounded())) minutes"
@@ -638,14 +502,14 @@ enum CodexAppServerClient {
         return "Codex app-server stopped responding: no protocol event arrived for \(duration). Stop the turn or update Codex, then try again."
     }
 
-    private static let missingMessage = "Codex is not installed or PopChat cannot find it. Install Codex yourself and run `codex login`. If it is already installed, run `which codex` in Terminal and paste the result into the Codex path field in Settings → Providers."
+    fileprivate static let missingMessage = "Codex is not installed or PopChat cannot find it. Install Codex yourself and run `codex login`. If it is already installed, run `which codex` in Terminal and paste the result into the Codex path field in Settings → Providers."
 
-    private struct Account: Sendable {
+    fileprivate struct Account: Sendable {
         var email: String?
         var plan: String?
     }
 
-    private static func readChatGPTAccount(_ session: Session) throws -> Account {
+    fileprivate static func readChatGPTAccount(_ session: Session) throws -> Account {
         let response = try session.request(method: "account/read", params: ["refreshToken": .bool(false)])
         let result = try responseResult(response, method: "account/read")
         guard let account = result["account"]?.objectValue else {
@@ -674,13 +538,23 @@ enum CodexAppServerClient {
         return result
     }
 
-    private struct HistorySplit {
+    fileprivate struct HistorySplit {
         var systemPrompt: String?
-        var priorMessages: [OpenAIChatClient.WireMessage]
-        var currentMessage: OpenAIChatClient.WireMessage
+        /// Every user/assistant message up to and INCLUDING the user message
+        /// this turn is about — the exact sequence a thread must hold to answer
+        /// it. The last element is always the user message; anything the store
+        /// appended after it (the empty streaming row) is dropped.
+        ///
+        /// Returned whole rather than pre-split into prior/current because a
+        /// backend holding a live thread needs to know which of these it has
+        /// already delivered, and that is a comparison over the whole sequence.
+        var conversational: [OpenAIChatClient.WireMessage]
+
+        var priorMessages: ArraySlice<OpenAIChatClient.WireMessage> { conversational.dropLast() }
+        var currentMessage: OpenAIChatClient.WireMessage { conversational[conversational.count - 1] }
     }
 
-    private static func splitHistory(_ history: [OpenAIChatClient.WireMessage]) throws -> HistorySplit {
+    fileprivate static func splitHistory(_ history: [OpenAIChatClient.WireMessage]) throws -> HistorySplit {
         let system = history.first { $0.role == "system" }.flatMap(textContent)
         let conversational = history.filter { $0.role == "user" || $0.role == "assistant" }
         guard let lastUser = conversational.lastIndex(where: { $0.role == "user" }) else {
@@ -688,8 +562,7 @@ enum CodexAppServerClient {
         }
         return HistorySplit(
             systemPrompt: system,
-            priorMessages: Array(conversational[..<lastUser]),
-            currentMessage: conversational[lastUser]
+            conversational: Array(conversational[...lastUser])
         )
     }
 
@@ -702,7 +575,7 @@ enum CodexAppServerClient {
     }
 
     /// Raw Responses API item accepted by `thread/inject_items`.
-    private static func responseItem(_ message: OpenAIChatClient.WireMessage) -> JSONValue {
+    fileprivate static func responseItem(_ message: OpenAIChatClient.WireMessage) -> JSONValue {
         let assistant = message.role == "assistant"
         let textType = assistant ? "output_text" : "input_text"
         var content: [JSONValue] = []
@@ -727,7 +600,7 @@ enum CodexAppServerClient {
         ])
     }
 
-    private static func turnInput(_ message: OpenAIChatClient.WireMessage) -> [JSONValue] {
+    fileprivate static func turnInput(_ message: OpenAIChatClient.WireMessage) -> [JSONValue] {
         var input: [JSONValue] = []
         switch message.content {
         case .text(let text):
@@ -750,14 +623,14 @@ enum CodexAppServerClient {
     /// the protocol's begin event carries just a call id — the query arrives
     /// with the end event — so labeling at `item/started` printed a bare
     /// "searched the web:" with nothing after the colon.
-    private static func webSearchLabel(_ item: JSONObject) -> String {
+    fileprivate static func webSearchLabel(_ item: JSONObject) -> String {
         let query = (item["query"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return query.isEmpty
             ? "Codex app-server searched the web."
             : "Codex app-server searched the web: \(query)"
     }
 
-    private static func activityLabel(item: JSONObject?) -> String? {
+    fileprivate static func activityLabel(item: JSONObject?) -> String? {
         guard let item, let type = item["type"]?.stringValue else { return nil }
         switch type {
         case "commandExecution":
@@ -771,7 +644,7 @@ enum CodexAppServerClient {
         }
     }
 
-    private static func friendlyError(_ message: String) -> String {
+    fileprivate static func friendlyError(_ message: String) -> String {
         let lower = message.lowercased()
         if lower.contains("usage limit") || lower.contains("rate limit") || lower.contains("quota") {
             return "Your ChatGPT plan's Codex usage limit was reached. \(message)"
@@ -779,7 +652,7 @@ enum CodexAppServerClient {
         return "Codex app-server: \(message)"
     }
 
-    private static func appServerWorkingDirectory() throws -> URL {
+    fileprivate static func appServerWorkingDirectory() throws -> URL {
         let support = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -789,6 +662,704 @@ enum CodexAppServerClient {
         let directory = support.appending(path: "PopChat/codex-app-server-sandbox", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+}
+
+// MARK: - Backend
+
+/// The Codex app-server as a `ChatBackend`.
+///
+/// Lives in this file rather than beside the protocol because the JSONL
+/// transport below it (`Session`, `JSONValue`) is deliberately file-private:
+/// nothing outside this adapter should be able to speak the protocol directly.
+/// Holds ONE `codex` child process and ONE ephemeral thread across the turns of
+/// a conversation, so a follow-up question reuses the backend's prompt cache
+/// instead of replaying the transcript into a brand-new thread.
+///
+/// Measured on codex-cli 0.149.0: a second turn in a live thread reported 11,008
+/// of 11,635 input tokens cached, while two fresh threads seconds apart with the
+/// same prefix cached nothing at all. The cache keys off the SESSION, not off
+/// prefix content, so the only way to have it is to keep the thread.
+///
+/// The safety argument this rests on, in one sentence: the store's transcript is
+/// authoritative and the live thread is a pure cache, reused only when the
+/// backend can prove — by fingerprint, message by message — that the thread was
+/// told exactly the prefix the store now believes. Anything else rebuilds.
+///
+/// Ephemeral threads are deliberate. Nothing here is persisted or resumable:
+/// `thread/resume` reads rollout state from disk that an ephemeral thread never
+/// writes, and it would not restore the backend-side cache anyway.
+final class CodexAppServerBackend: ChatBackend {
+    private let executableOverride: URL?
+    private let inactivityTimeout: TimeInterval
+
+    /// Serial, and the reason "at most one turn in flight" holds by
+    /// construction. It matters because `ChatStore` releases the composer
+    /// before a turn's tail finishes (see its streamTask), so Stop followed
+    /// immediately by a new send is a real interleaving: the second turn's block
+    /// simply runs after the first one's teardown, and if that teardown dirtied
+    /// the session, the second turn rebuilds.
+    private let queue = DispatchQueue(
+        label: "com.chenle.PopChat.codex-app-server.turn", qos: .userInitiated
+    )
+    /// Cancellation must never queue behind the turn it is cancelling.
+    private let cancelQueue = DispatchQueue(
+        label: "com.chenle.PopChat.codex-app-server.cancel", qos: .userInitiated
+    )
+    /// The interrupt's fallback timer lives on its OWN queue: if the interrupt
+    /// write blocks, `cancelQueue` is stuck, and a fallback scheduled there
+    /// could never fire — which is the one thing the fallback exists for.
+    private let fallbackQueue = DispatchQueue(
+        label: "com.chenle.PopChat.codex-app-server.cancel-fallback", qos: .userInitiated
+    )
+
+    /// How long after an interrupt to give up and kill the child.
+    private static let interruptGrace: TimeInterval = 1
+    /// Idle lifetime of the child process. Past this window a non-pinned
+    /// conversation has been replaced by a fresh chat anyway, so the session
+    /// would be dropped regardless; a PINNED one is exactly the case where a
+    /// resident `codex` would otherwise sit for hours. One knob, not two.
+    private static var idleTimeout: TimeInterval { ChatStore.staleAfter }
+
+    private let lock = NSLock()
+    private var session: Session?
+    private var threadID: String?
+    /// What the live child was LAUNCHED with. `web_search` is a process
+    /// argument, so flipping the globe needs a new process — unlike model and
+    /// effort, which ride on `turn/start` and were verified to override the
+    /// values `thread/start` pinned.
+    private var launchedWebSearch: Bool?
+    /// What the live thread was STARTED with. A `thread/start` parameter, so a
+    /// change needs a new thread but not a new process.
+    private var threadInstructions: String?
+    /// Fingerprints of the wire messages this thread has already been given,
+    /// in order.
+    private var delivered: [Int] = []
+    private var dirty = false
+    private var turnEpoch = 0
+    private var turnInFlight = false
+    /// Nil until `turn/started` names the turn — which is why cancelling during
+    /// setup has to fall back to killing the child.
+    private var activeTurnID: String?
+    private var lastTurnID: String?
+    private var currentWatchdog: InactivityWatchdog?
+    private var idleTimer: DispatchSourceTimer?
+
+    struct TokenUsage: Equatable {
+        var input: Int
+        var cached: Int
+    }
+    private var lastTokenUsage: TokenUsage?
+
+    /// What the most recent turn reported. Diagnostic only — nothing in the app
+    /// reads it; the live cache harness does.
+    var tokenUsage: TokenUsage? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastTokenUsage
+    }
+
+    /// The overrides exist for the deterministic smoke harnesses, which drive a
+    /// fake app-server executable and a short timeout.
+    init(executableOverride: URL? = nil, inactivityTimeout: TimeInterval = 300) {
+        self.executableOverride = executableOverride
+        self.inactivityTimeout = inactivityTimeout
+    }
+
+    deinit {
+        session?.stop()
+        idleTimer?.cancel()
+    }
+
+    // MARK: - ChatBackend
+
+    func stream(_ turn: ChatTurn) -> AsyncStream<ChatStreamEvent> {
+        AsyncStream { continuation in
+            let watchdog = InactivityWatchdog(timeout: max(inactivityTimeout, 0.05)) {
+                [weak self] in
+                // A child that has stopped speaking the protocol is unusable, so
+                // this kills it outright; the blocked read then returns and the
+                // turn reports the timeout.
+                self?.discard()
+            }
+            queue.async { [self] in
+                runTurn(turn, watchdog: watchdog, continuation: continuation)
+                watchdog.cancel()
+                continuation.finish()
+            }
+            continuation.onTermination = { [weak self] reason in
+                watchdog.cancel()
+                // `.finished` is the NORMAL end of every turn. Cancelling there
+                // would interrupt and then kill the very session this class
+                // exists to keep, respawn on every turn, and present as
+                // "caching is still broken" — this feature's own bug, delivered
+                // by its safety wiring.
+                if case .cancelled = reason { self?.cancelTurn() }
+            }
+        }
+    }
+
+    func cancelTurn() {
+        cancelQueue.async { [weak self] in
+            guard let self else { return }
+            lock.lock()
+            // No-op when nothing is running: ChatStore.stop() can race a turn
+            // that just ended, and the stream's termination handler asks for the
+            // same thing this call already did.
+            guard turnInFlight, let session else { lock.unlock(); return }
+            let epoch = turnEpoch
+            let thread = threadID
+            let turnID = activeTurnID
+            lock.unlock()
+
+            // Armed BEFORE the write, not after. A cancel that blocks on the
+            // write lock behind a wedged 1 MB inject_items would never reach a
+            // later arming step, leaving nothing but the inactivity watchdog to
+            // bound the hang.
+            armInterruptFallback(epoch: epoch)
+
+            guard let thread, let turnID else {
+                // Stopped during setup — spawn, initialize, inject — where no
+                // turn exists to interrupt. Killing the child is what PopChat
+                // did for every cancellation before `turn/interrupt`, and it is
+                // still the right answer here.
+                discard()
+                return
+            }
+            _ = try? session.beginRequest(method: "turn/interrupt", params: [
+                "threadId": .string(thread),
+                "turnId": .string(turnID),
+            ])
+        }
+    }
+
+    func discard() {
+        lock.lock()
+        let dying = session
+        session = nil
+        threadID = nil
+        launchedWebSearch = nil
+        threadInstructions = nil
+        delivered = []
+        dirty = false
+        activeTurnID = nil
+        idleTimer?.cancel()
+        idleTimer = nil
+        lock.unlock()
+        dying?.stop()
+    }
+
+    // MARK: - Cancellation fallback
+
+    private func armInterruptFallback(epoch: Int) {
+        fallbackQueue.asyncAfter(deadline: .now() + Self.interruptGrace) { [weak self] in
+            guard let self else { return }
+            lock.lock()
+            // The epoch guard is not belt-and-braces. Without it: stop at t=0
+            // arms this, the interrupt lands at t=0.2 and dirties the thread,
+            // the user sends again immediately, the new turn starts a fresh
+            // thread on the SAME live process at t=0.3 — and this timer kills
+            // that process mid-turn at t=1.0.
+            let stale = turnEpoch != epoch || !turnInFlight
+            lock.unlock()
+            guard !stale else { return }
+            discard()
+        }
+    }
+
+    // MARK: - Turn
+
+    private enum TurnOutcome {
+        /// The thread now holds this answer and may be reused.
+        case clean(answer: String, fingerprints: [Int])
+        /// Anything else. `killProcess` distinguishes a thread that merely
+        /// disagrees with the store from a child that is no longer usable.
+        case spoiled(killProcess: Bool)
+    }
+
+    private func runTurn(
+        _ turn: ChatTurn,
+        watchdog: InactivityWatchdog,
+        continuation: AsyncStream<ChatStreamEvent>.Continuation
+    ) {
+        let epoch = beginTurn(watchdog: watchdog)
+        var outcome = TurnOutcome.spoiled(killProcess: false)
+        defer { endTurn(epoch: epoch, outcome: outcome) }
+
+        do {
+            let split = try CodexAppServerClient.splitHistory(turn.transcript)
+            let instructions = CodexAppServerClient.developerInstructions(
+                systemPrompt: split.systemPrompt, webSearch: turn.codexWebSearch
+            )
+            let fingerprints = split.conversational.map(Self.fingerprint)
+
+            let prepared = try prepare(
+                turn: turn, split: split, instructions: instructions,
+                fingerprints: fingerprints, watchdog: watchdog, continuation: continuation
+            )
+
+            var turnParams: JSONObject = [
+                "approvalPolicy": .string("never"),
+                "input": .array(CodexAppServerClient.turnInput(split.currentMessage)),
+                "model": .string(turn.config.model),
+                "sandboxPolicy": .object([
+                    "type": .string("readOnly"),
+                    "networkAccess": .bool(false),
+                ]),
+                "threadId": .string(prepared.threadID),
+            ]
+            if let effort = turn.config.reasoningEffort {
+                turnParams["effort"] = .string(effort)
+            }
+            // A turn can start emitting notifications before app-server writes the
+            // matching JSON-RPC response. Waiting through `request` would buffer
+            // those deltas and make the whole answer appear at once.
+            continuation.yield(.status("Waiting for \(turn.config.model)…"))
+            let turnRequestID = try prepared.session.beginRequest(
+                method: "turn/start", params: turnParams
+            )
+            outcome = try readTurn(
+                session: prepared.session,
+                turnRequestID: turnRequestID,
+                fingerprints: fingerprints,
+                watchdog: watchdog,
+                continuation: continuation
+            )
+        } catch is CancellationError {
+            if watchdog.didTimeOut {
+                continuation.yield(.error(CodexAppServerClient.timeoutMessage(inactivityTimeout)))
+            }
+            outcome = .spoiled(killProcess: true)
+        } catch let error as CodexAppServerClient.ClientError {
+            if watchdog.didTimeOut {
+                continuation.yield(.error(CodexAppServerClient.timeoutMessage(inactivityTimeout)))
+            } else if !isDiscarded {
+                continuation.yield(.error(error.message))
+            }
+            outcome = .spoiled(killProcess: true)
+        } catch {
+            if watchdog.didTimeOut {
+                continuation.yield(.error(CodexAppServerClient.timeoutMessage(inactivityTimeout)))
+            } else if !isDiscarded {
+                continuation.yield(.error("Codex app-server failed: \(error.localizedDescription)"))
+            }
+            outcome = .spoiled(killProcess: true)
+        }
+    }
+
+    private struct Prepared {
+        var session: Session
+        var threadID: String
+    }
+
+    /// Resolves this turn to a live session and thread, reusing as much as can
+    /// be PROVEN reusable and rebuilding the rest.
+    private func prepare(
+        turn: ChatTurn,
+        split: CodexAppServerClient.HistorySplit,
+        instructions: String,
+        fingerprints: [Int],
+        watchdog: InactivityWatchdog,
+        continuation: AsyncStream<ChatStreamEvent>.Continuation
+    ) throws -> Prepared {
+        lock.lock()
+        let live = session
+        let liveThread = threadID
+        let liveWebSearch = launchedWebSearch
+        let liveInstructions = threadInstructions
+        let liveDelivered = delivered
+        let spoiled = dirty
+        lock.unlock()
+
+        // Every condition is a thing that would make the thread's history
+        // disagree with the transcript, or a `thread/start`/launch parameter
+        // that the thread was fixed with.
+        let reusableThread = !spoiled
+            && live != nil
+            && live?.isRunning == true
+            && liveThread != nil
+            && liveWebSearch == turn.codexWebSearch
+            && liveInstructions == instructions
+            && liveDelivered.count < fingerprints.count
+            && Array(fingerprints.prefix(liveDelivered.count)) == liveDelivered
+
+        if reusableThread, let live, let liveThread {
+            // The thread already holds everything up to `liveDelivered.count`;
+            // hand it only what it has not seen.
+            try inject(
+                Array(split.conversational.dropFirst(liveDelivered.count).dropLast()),
+                session: live, threadID: liveThread
+            )
+            return Prepared(session: live, threadID: liveThread)
+        }
+
+        // A live child can still host a NEW thread — which is why an interrupt
+        // or a dirty turn costs a thread/start, not a respawn. Only a web-search
+        // change (a launch argument) forces a new process.
+        var active: Session
+        if let live, live.isRunning, liveWebSearch == turn.codexWebSearch {
+            active = live
+        } else {
+            discard()
+            // Spawning means seconds of silence before the first token — say
+            // what is happening or the app reads as frozen. `.status` is
+            // transient (the waiting row), not a permanent transcript row.
+            continuation.yield(.status("Starting Codex…"))
+            guard let executable = executableOverride ?? CodexAppServerClient.executableURL() else {
+                throw CodexAppServerClient.ClientError(
+                    message: CodexAppServerClient.missingMessage, reason: .missing
+                )
+            }
+            let fresh = try Session(
+                executable: executable,
+                webSearch: turn.codexWebSearch,
+                // Forwards to whichever turn is running, NOT to the watchdog
+                // that happened to be current when the child was spawned —
+                // a session outlives its first turn now, and a stale watchdog
+                // would never be kicked again.
+                onMessage: { [weak self] in self?.kickWatchdog() }
+            )
+            lock.lock()
+            session = fresh
+            launchedWebSearch = turn.codexWebSearch
+            threadID = nil
+            threadInstructions = nil
+            delivered = []
+            lock.unlock()
+            // The watchdog's clock starts when it is CONSTRUCTED, which is before
+            // this queue was even scheduled and before the child was spawned.
+            // Resolving the executable and launching Codex (cold start, Gatekeeper
+            // scan on first run) is not the process being unresponsive — start
+            // measuring silence only now that it is actually up.
+            watchdog.kick()
+            try fresh.initialize()
+            _ = try CodexAppServerClient.readChatGPTAccount(fresh)
+            active = fresh
+        }
+
+        let thread = try startThread(
+            session: active, instructions: instructions, model: turn.config.model
+        )
+        lock.lock()
+        threadID = thread
+        threadInstructions = instructions
+        delivered = []
+        dirty = false
+        lock.unlock()
+
+        try inject(Array(split.priorMessages), session: active, threadID: thread)
+        return Prepared(session: active, threadID: thread)
+    }
+
+    private func startThread(session: Session, instructions: String, model: String) throws -> String {
+        let sandboxDirectory = try CodexAppServerClient.appServerWorkingDirectory()
+        func params(_ withBaseInstructions: Bool) -> JSONObject {
+            CodexAppServerClient.threadStartParams(
+                developerInstructions: instructions,
+                model: model,
+                sandboxDirectory: sandboxDirectory,
+                withBaseInstructions: withBaseInstructions
+            )
+        }
+        // Retried ONCE without `baseInstructions` on any thread/start failure.
+        // PopChat runs whatever `codex` the user has installed (see
+        // executableURL), and a build predating the parameter would otherwise
+        // turn a token optimization into a provider that cannot start a thread
+        // at all. Deliberately not conditioned on the error text: that prose is
+        // the server's to reword, and this file already treats
+        // substring-matching it as a bug (see ClientError.Reason).
+        let result: JSONObject
+        do {
+            result = try CodexAppServerClient.responseResult(
+                try session.request(method: "thread/start", params: params(true)),
+                method: "thread/start"
+            )
+        } catch {
+            result = try CodexAppServerClient.responseResult(
+                try session.request(method: "thread/start", params: params(false)),
+                method: "thread/start"
+            )
+        }
+        guard let id = result["thread"]?.objectValue?["id"]?.stringValue else {
+            throw CodexAppServerClient.ClientError(
+                message: "Codex app-server returned an invalid thread/start response."
+            )
+        }
+        return id
+    }
+
+    private func inject(
+        _ messages: [OpenAIChatClient.WireMessage], session: Session, threadID: String
+    ) throws {
+        guard !messages.isEmpty else { return }
+        let response = try session.request(method: "thread/inject_items", params: [
+            "threadId": .string(threadID),
+            "items": .array(messages.map(CodexAppServerClient.responseItem)),
+        ])
+        _ = try CodexAppServerClient.responseResult(response, method: "thread/inject_items")
+    }
+
+    /// The turn's event loop. Returns what the session may be used for next.
+    private func readTurn(
+        session: Session,
+        turnRequestID: Int64,
+        fingerprints: [Int],
+        watchdog: InactivityWatchdog,
+        continuation: AsyncStream<ChatStreamEvent>.Continuation
+    ) throws -> TurnOutcome {
+        // A turn can produce SEVERAL agentMessage items (a preamble, then the
+        // answer), and the protocol keys every delta and completion by item
+        // id. `ItemAssembly` holds that shape; its doc comment carries the
+        // laws (authoritative idempotent completions, willRetry semantics).
+        var items = CodexAppServerClient.ItemAssembly()
+        var outcome: TurnOutcome?
+
+        while outcome == nil, let message = try session.nextMessage() {
+            if message["id"]?.intValue == turnRequestID {
+                _ = try CodexAppServerClient.responseResult(message, method: "turn/start")
+                continue
+            }
+            guard let method = message["method"]?.stringValue,
+                  let params = message["params"]?.objectValue else { continue }
+
+            if method == "turn/started" {
+                if let id = params["turn"]?.objectValue?["id"]?.stringValue {
+                    setActiveTurnID(id)
+                }
+                continue
+            }
+            guard accepts(params: params) else { continue }
+
+            switch method {
+            case "item/agentMessage/delta":
+                if let delta = params["delta"]?.stringValue {
+                    // `itemId` is required by the protocol; "" is a last-resort
+                    // key so a nonconforming server still streams.
+                    items.delta(id: params["itemId"]?.stringValue ?? "", text: delta)
+                    continuation.yield(.partial(items.snapshot))
+                }
+            case "item/started":
+                if let activity = CodexAppServerClient.activityLabel(item: params["item"]?.objectValue) {
+                    continuation.yield(.activity(activity))
+                } else {
+                    switch params["item"]?.objectValue?["type"]?.stringValue {
+                    case "reasoning":
+                        // Reasoning items stream no visible text but can run
+                        // for a long time — the one signal that the model is
+                        // alive.
+                        continuation.yield(.status("Reasoning…"))
+                    case "webSearch":
+                        continuation.yield(.status("Searching the web…"))
+                    default:
+                        break
+                    }
+                }
+            case "item/completed":
+                guard let item = params["item"]?.objectValue else { continue }
+                switch item["type"]?.stringValue {
+                case "agentMessage":
+                    items.completed(
+                        id: item["id"]?.stringValue ?? "",
+                        text: item["text"]?.stringValue ?? ""
+                    )
+                    continuation.yield(.partial(items.snapshot))
+                case "webSearch":
+                    continuation.yield(.activity(CodexAppServerClient.webSearchLabel(item)))
+                default:
+                    break
+                }
+            case "error":
+                if params["willRetry"]?.boolValue == true {
+                    // Codex is about to re-deliver the aborted attempt, so an
+                    // in-flight partial would double up with the re-stream —
+                    // drop it, and say what the pause is instead of stalling
+                    // silently. NOT a reason to spoil the session: the turn can
+                    // still complete cleanly, and giving up the cache here would
+                    // punish the transport exactly when it recovered.
+                    if items.dropInFlight() {
+                        continuation.yield(.partial(items.snapshot))
+                    }
+                    continuation.yield(.status("Temporary error — Codex is retrying…"))
+                } else if let message = params["error"]?.objectValue?["message"]?.stringValue {
+                    continuation.yield(.error(CodexAppServerClient.friendlyError(message)))
+                }
+            case "thread/tokenUsage/updated":
+                // Not shown anywhere in the UI. Recorded because the entire
+                // point of holding a thread open is the cached fraction of the
+                // input, and a claim about it should be checkable against the
+                // real Codex rather than argued — see
+                // `--smoke-codex-app-server-cache`.
+                if let last = params["tokenUsage"]?.objectValue?["last"]?.objectValue {
+                    lock.lock()
+                    lastTokenUsage = TokenUsage(
+                        input: Int(last["inputTokens"]?.intValue ?? 0),
+                        cached: Int(last["cachedInputTokens"]?.intValue ?? 0)
+                    )
+                    lock.unlock()
+                }
+            case "turn/completed":
+                let turn = params["turn"]?.objectValue
+                let status = turn?["status"]?.stringValue ?? "failed"
+                let answer = items.snapshot
+                if status == "completed" || status == "interrupted" {
+                    continuation.yield(.done(answer))
+                } else {
+                    let message = turn?["error"]?.objectValue?["message"]?.stringValue
+                        ?? "Codex app-server turn failed (status: \(status))."
+                    continuation.yield(.error(CodexAppServerClient.friendlyError(message)))
+                }
+                // Only a clean completion leaves the thread agreeing with the
+                // store. An interrupted thread holds a partial answer the panel
+                // may have trimmed, and a failed one may hold nothing at all —
+                // both rebuild next time, which now costs a thread/start rather
+                // than a respawn. An empty answer counts as spoiled too: the
+                // store drops an empty assistant row, so the thread would hold
+                // an item the transcript does not.
+                outcome = (status == "completed" && !answer.isEmpty)
+                    ? .clean(answer: answer, fingerprints: fingerprints)
+                    : .spoiled(killProcess: false)
+            default:
+                continue
+            }
+        }
+
+        if let outcome { return outcome }
+        if watchdog.didTimeOut {
+            continuation.yield(.error(CodexAppServerClient.timeoutMessage(inactivityTimeout)))
+        } else if !isDiscarded {
+            continuation.yield(.error("Codex app-server exited before the response completed. Update Codex and try again."))
+        }
+        return .spoiled(killProcess: true)
+    }
+
+    // MARK: - State
+
+    private func beginTurn(watchdog: InactivityWatchdog) -> Int {
+        lock.lock()
+        turnEpoch += 1
+        turnInFlight = true
+        activeTurnID = nil
+        currentWatchdog = watchdog
+        idleTimer?.cancel()
+        idleTimer = nil
+        let epoch = turnEpoch
+        lock.unlock()
+        return epoch
+    }
+
+    private func endTurn(epoch: Int, outcome: TurnOutcome) {
+        lock.lock()
+        turnInFlight = false
+        lastTurnID = activeTurnID
+        activeTurnID = nil
+        currentWatchdog = nil
+        var kill = false
+        switch outcome {
+        case .clean(let answer, let fingerprints):
+            // The thread now also holds its own reply, so record it: the next
+            // turn's transcript will carry that assistant message, and the
+            // prefix has to match through it.
+            delivered = fingerprints + [Self.fingerprint(
+                OpenAIChatClient.WireMessage(role: "assistant", content: .text(answer))
+            )]
+            dirty = false
+        case .spoiled(let killProcess):
+            dirty = true
+            kill = killProcess
+        }
+        lock.unlock()
+        if kill {
+            discard()
+        } else {
+            armIdleTimer()
+        }
+    }
+
+    private func armIdleTimer() {
+        lock.lock()
+        idleTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: fallbackQueue)
+        timer.schedule(deadline: .now() + Self.idleTimeout)
+        timer.setEventHandler { [weak self] in self?.discard() }
+        idleTimer = timer
+        lock.unlock()
+        timer.resume()
+    }
+
+    private func setActiveTurnID(_ id: String) {
+        lock.lock()
+        activeTurnID = id
+        lock.unlock()
+    }
+
+    private func kickWatchdog() {
+        lock.lock()
+        let watchdog = currentWatchdog
+        lock.unlock()
+        watchdog?.kick()
+    }
+
+    private var isDiscarded: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return session == nil || session?.isRunning == false
+    }
+
+    /// Whether a notification belongs to the turn being read.
+    ///
+    /// Presence-gated on purpose. `turnId` is required by the 0.149.0 schema and
+    /// present on every notification observed, but PopChat runs whatever `codex`
+    /// the user installed, and filtering strictly against a build that omits it
+    /// would drop every delta and render empty replies. When the ids are there,
+    /// they are honored: a session outlives its turns now, so a straggler from
+    /// the previous turn would otherwise append to the wrong message.
+    private func accepts(params: JSONObject) -> Bool {
+        let incoming = params["turnId"]?.stringValue
+            ?? params["turn"]?.objectValue?["id"]?.stringValue
+        guard let incoming else { return true }
+        lock.lock()
+        let active = activeTurnID
+        let previous = lastTurnID
+        lock.unlock()
+        if let active { return incoming == active }
+        // Before `turn/started`, the only id we can rule out is the last turn's.
+        return incoming != previous
+    }
+
+    /// Identity of a wire message, for deciding whether the live thread has
+    /// already been told it.
+    ///
+    /// Hashed rather than stored: a conversation can carry megabytes of image
+    /// data URLs, and this list is consulted on every send. `Hasher` is seeded
+    /// per PROCESS, which is exactly this list's lifetime — nothing is
+    /// persisted, and a fingerprint from a previous launch would describe a
+    /// thread that no longer exists.
+    ///
+    /// Taken over the RESOLVED wire message, which is what makes it catch more
+    /// than edits: `ChatStore.wireContent` re-renders historical attachments
+    /// against today's capabilities on every send, so a capability change
+    /// alters an already-delivered message's fingerprint and correctly forces a
+    /// rebuild.
+    private static func fingerprint(_ message: OpenAIChatClient.WireMessage) -> Int {
+        var hasher = Hasher()
+        hasher.combine(message.role)
+        switch message.content {
+        case .text(let text):
+            hasher.combine(0)
+            hasher.combine(text)
+        case .parts(let parts):
+            hasher.combine(1)
+            for part in parts {
+                hasher.combine(part.type)
+                hasher.combine(part.text)
+                hasher.combine(part.imageURL?.url)
+                hasher.combine(part.file?.filename)
+                hasher.combine(part.file?.fileData)
+            }
+        case nil:
+            hasher.combine(2)
+        }
+        return hasher.finalize()
     }
 }
 
@@ -846,6 +1417,12 @@ private enum JSONValue: Codable, Sendable {
     }
 }
 
+/// Cancellation handle for `inspect`, whose session is genuinely one-shot: it
+/// asks the child a few questions and is done.
+///
+/// Turns do NOT use this. `CodexAppServerBackend` owns its session across turns
+/// and cancels with `turn/interrupt` rather than by killing the child, so it
+/// keeps that state itself.
 private final class SessionHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var session: Session?
@@ -955,8 +1532,30 @@ private final class Session: @unchecked Sendable {
     private let stateLock = NSLock()
     private var stopped = false
     private var stderrData = Data()
+    /// Touched ONLY by the turn queue, which owns the read side end to end. Not
+    /// under any lock, and must stay that way: `readMessage` blocks inside
+    /// `availableData` for as long as the model is thinking.
     private var readBuffer = Data()
     private var bufferedMessages: [JSONObject] = []
+
+    /// Serializes WRITERS against each other, and nothing else.
+    ///
+    /// It exists because a session now outlives one turn, so a second writer is
+    /// possible: `cancelTurn` writes `turn/interrupt` from a utility queue while
+    /// the turn queue is blocked reading. Two concurrent `write(contentsOf:)`
+    /// calls could otherwise interleave bytes and corrupt the JSONL framing.
+    ///
+    /// What it must NEVER become is a lock that teardown waits on. `stop()` and
+    /// `appendStderr` take `stateLock` only; no `stateLock` holder ever takes
+    /// this. So a writer blocked on a full stdin buffer can stall another
+    /// writer — never the Stop button, never the watchdog, never the MainActor.
+    /// See `send` for why that distinction is load-bearing.
+    private let writeLock = NSLock()
+
+    /// Its own lock rather than `stateLock`: the id is allocated by both the
+    /// turn queue and the cancelling utility queue, and holding `stateLock`
+    /// across the write that follows is exactly what `send` documents as fatal.
+    private let requestIDLock = NSLock()
     private var nextRequestID: Int64 = 1
 
     /// `stop()` terminates the child precisely when a write may be blocked on its
@@ -1060,8 +1659,10 @@ private final class Session: @unchecked Sendable {
     /// such as `turn/start` use this so their notifications can be handled while
     /// the matching response is still pending.
     func beginRequest(method: String, params: JSONObject) throws -> Int64 {
+        requestIDLock.lock()
         let id = nextRequestID
         nextRequestID += 1
+        requestIDLock.unlock()
         try send(["id": .integer(id), "method": .string(method), "params": .object(params)])
         return id
     }
@@ -1073,6 +1674,14 @@ private final class Session: @unchecked Sendable {
     func nextMessage() throws -> JSONObject? {
         if !bufferedMessages.isEmpty { return bufferedMessages.removeFirst() }
         return try readMessage()
+    }
+
+    /// Whether the child is still alive — the cheapest of the reuse conditions,
+    /// and the one that catches a codex that died between turns.
+    var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return !stopped && process.isRunning
     }
 
     func stop() {
@@ -1090,7 +1699,7 @@ private final class Session: @unchecked Sendable {
     private func send(_ object: JSONObject) throws {
         var data = try JSONEncoder().encode(object)
         data.append(0x0A)
-        // The `stopped` READ is locked; the write deliberately is NOT.
+        // The `stopped` READ is locked; the write is NEVER under stateLock.
         // `write(contentsOf:)` blocks as soon as the child's ~64 KB stdin buffer
         // fills — a `thread/inject_items` carrying one image attachment is ~1 MB
         // — and it can only unblock if the child drains. Holding stateLock across
@@ -1100,10 +1709,20 @@ private final class Session: @unchecked Sendable {
         // runs on the consuming task's actor, so that hang reaches the MainActor.
         // stop() deliberately does not close stdin, so this fd cannot be closed
         // and reused underneath an in-flight write.
+        //
+        // `writeLock` is a DIFFERENT lock and preserves all of the above: it is
+        // held across the blocking write, but only writers ever take it, so the
+        // worst case is one writer waiting on another. Teardown still cannot be
+        // blocked by a write, which is the invariant that comment protects. If a
+        // writer is stuck here, stop()'s terminate() closes the child's pipe
+        // ends and this write fails with EPIPE (SIGPIPE ignored above) rather
+        // than hanging — which is what releases the lock for anyone behind it.
         stateLock.lock()
         let alreadyStopped = stopped
         stateLock.unlock()
         guard !alreadyStopped else { throw CancellationError() }
+        writeLock.lock()
+        defer { writeLock.unlock() }
         try input.fileHandleForWriting.write(contentsOf: data)
     }
 

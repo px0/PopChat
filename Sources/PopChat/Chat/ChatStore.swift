@@ -52,6 +52,24 @@ final class ChatStore: ObservableObject {
     private let shortcutStore: ShortcutStore
     private var streamTask: Task<Void, Never>?
 
+    /// This conversation's transport, alive across its turns. Rebuilt when the
+    /// provider KIND changes (a different protocol needs a different class); a
+    /// model, effort or search change is the backend's own business, since only
+    /// it knows whether its state survives one — see `ChatBackend`.
+    private var backend: ChatBackend?
+    private var backendKind: ProviderKind?
+
+    /// Called wherever conversation identity changes. Every one of these sites
+    /// would otherwise leave a live Codex thread holding the PREVIOUS
+    /// conversation, and `fork` is the sharp case: a fork's transcript shares a
+    /// prefix with its parent, so a backend matching on prefix alone would
+    /// happily keep answering into the parent's thread.
+    private func discardBackend() {
+        backend?.discard()
+        backend = nil
+        backendKind = nil
+    }
+
     // Streaming reveal: partial snapshots land in `streamTarget`; a drain task
     // reveals them — per-character at a paced ~180 chars/s, per-sentence at
     // boundaries. The per-character pacing MUST be allowed to lag behind arrival
@@ -324,19 +342,23 @@ final class ChatStore: ObservableObject {
         streamFinished = false
         streamingMessageID = assistantMessage.id
 
-        // Same event stream either way — only the wire protocol differs.
-        let stream: AsyncStream<ChatStreamEvent>
-        switch config.kind {
-        case .chatGPT:
-            stream = CodexResponsesClient.run(
-                history: history, config: config, webAccess: webAccess,
-                sessionID: conversationID.uuidString.lowercased()
-            )
-        case .codexAppServer:
-            stream = CodexAppServerClient.run(history: history, config: config, webSearch: codexWebSearch)
-        case .openAICompatible:
-            stream = OpenAIChatClient.run(history: history, config: config, webAccess: webAccess)
+        // Same event stream whatever the backend — only the wire protocol, and
+        // whether the backend keeps anything between turns, differ.
+        let active: ChatBackend
+        if let backend, backendKind == config.kind {
+            active = backend
+        } else {
+            discardBackend()
+            active = ChatBackendFactory.make(kind: config.kind, conversationID: conversationID)
+            backend = active
+            backendKind = config.kind
         }
+        let stream = active.stream(ChatTurn(
+            transcript: history,
+            config: config,
+            webAccess: webAccess,
+            codexWebSearch: codexWebSearch
+        ))
 
         streamTask = Task {
             // The streaming assistant row stays last; activity rows are inserted above it.
@@ -674,6 +696,12 @@ final class ChatStore: ObservableObject {
     }
 
     func stop() {
+        // Told to the backend as well as to our own iterating task: a transport
+        // holding a live turn (Codex) has to interrupt it explicitly, and
+        // cancelling the task alone would leave the model generating an answer
+        // nobody will read. Idempotent — the stream's termination handler asks
+        // for the same thing.
+        backend?.cancelTurn()
         streamTask?.cancel()
         // Don't wait for the cancelled task's tail to clear it — the waiting row
         // must not keep pulsing "Reasoning…" after the user said stop.
@@ -719,6 +747,7 @@ final class ChatStore: ObservableObject {
         // never corrected, truncating the reply permanently.
         flushTypewriter()
         persist() // parent must be current on disk before the branch points into it
+        discardBackend()
         forkParentID = conversationID
         forkMessageID = messageID
         conversationID = UUID()
@@ -736,6 +765,7 @@ final class ChatStore: ObservableObject {
         recent = ConversationStore.listRecent()
         if id == conversationID {
             stop()
+            discardBackend()
             conversationID = UUID()
             messages.removeAll()
             forkParentID = nil
@@ -759,6 +789,7 @@ final class ChatStore: ObservableObject {
     func newChat() {
         stop()
         persist()
+        discardBackend()
         conversationID = UUID()
         messages.removeAll()
         forkParentID = nil
@@ -770,6 +801,7 @@ final class ChatStore: ObservableObject {
         guard id != conversationID else { return }
         stop()
         persist()
+        discardBackend()
         guard let loaded = ConversationStore.loadResolved(id: id) else {
             recent.removeAll { $0.id == id }
             messages.append(ChatMessage(role: .error, text: "Couldn't load that conversation — its file is missing or corrupt."))
