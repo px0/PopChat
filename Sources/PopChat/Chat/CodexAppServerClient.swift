@@ -715,11 +715,20 @@ final class CodexAppServerBackend: ChatBackend {
 
     /// How long after an interrupt to give up and kill the child.
     private static let interruptGrace: TimeInterval = 1
-    /// Idle lifetime of the child process. Past this window a non-pinned
-    /// conversation has been replaced by a fresh chat anyway, so the session
-    /// would be dropped regardless; a PINNED one is exactly the case where a
-    /// resident `codex` would otherwise sit for hours. One knob, not two.
-    private static var idleTimeout: TimeInterval { ChatStore.staleAfter }
+
+    /// Idle lifetime of the child process.
+    ///
+    /// Defaults to `ChatStore.staleAfter` deliberately: past that window a
+    /// non-pinned conversation has been replaced by a fresh chat anyway, so the
+    /// session would be dropped regardless — and a PINNED conversation is
+    /// exactly the case where a resident `codex` would otherwise sit for hours
+    /// holding memory for a chat nobody is having. One knob, not two that drift.
+    ///
+    /// Note the store's own staleness reset only runs when the panel is
+    /// SUMMONED (`startFreshIfStale`). Dismiss the panel and never come back and
+    /// this timer is the only thing that retires the child, which is why it is a
+    /// real mechanism rather than a backstop.
+    private let idleTimeout: TimeInterval
 
     private let lock = NSLock()
     private var session: Session?
@@ -761,9 +770,14 @@ final class CodexAppServerBackend: ChatBackend {
 
     /// The overrides exist for the deterministic smoke harnesses, which drive a
     /// fake app-server executable and a short timeout.
-    init(executableOverride: URL? = nil, inactivityTimeout: TimeInterval = 300) {
+    init(
+        executableOverride: URL? = nil,
+        inactivityTimeout: TimeInterval = 300,
+        idleTimeout: TimeInterval = ChatStore.staleAfter
+    ) {
         self.executableOverride = executableOverride
         self.inactivityTimeout = inactivityTimeout
+        self.idleTimeout = idleTimeout
     }
 
     deinit {
@@ -1279,7 +1293,7 @@ final class CodexAppServerBackend: ChatBackend {
         lock.lock()
         idleTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: fallbackQueue)
-        timer.schedule(deadline: .now() + Self.idleTimeout)
+        timer.schedule(deadline: .now() + idleTimeout)
         timer.setEventHandler { [weak self] in self?.discard() }
         idleTimer = timer
         lock.unlock()

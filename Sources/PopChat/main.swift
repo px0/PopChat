@@ -680,6 +680,25 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-ses
         expect(tally(logD).processes == 1, "D: reuse did not survive a turnId-less server")
         legacy.discard()
 
+        // F: an idle session retires itself. The store's own staleness reset
+        // only runs when the panel is summoned, so a conversation that is simply
+        // abandoned would otherwise leave `codex` resident indefinitely. Proven
+        // by a turn that WOULD have reused the thread having to spawn instead.
+        let logF = newLog("normal")
+        let idle = CodexAppServerBackend(
+            executableOverride: executable, inactivityTimeout: 10, idleTimeout: 0.4
+        )
+        let f1 = await run(idle, [system, user("q1")])
+        let beforeIdle = tally(logF)
+        expect(beforeIdle.processes == 1, "F: setup spawned \(beforeIdle.processes) processes")
+        try? await Task.sleep(for: .milliseconds(1_200))
+        let f2 = await run(idle, [system, user("q1"), assistant(f1), user("q2")])
+        let afterF = tally(logF)
+        expect(f2 == "answer1", "F: answer was \(f2) (a retired process restarts its turn counter)")
+        expect(afterF.processes == 2, "F: \(afterF.processes) processes — the idle child was never retired")
+        expect(afterF.injects == 1, "F: \(afterF.injects) inject_items, expected the transcript to be replayed")
+        idle.discard()
+
         // E: interrupt, then a follow-up inside the cancellation grace.
         let logE = newLog("interrupt")
         let cancelling = CodexAppServerBackend(executableOverride: executable, inactivityTimeout: 10)
@@ -693,7 +712,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-ses
         cancelling.discard()
 
         for failure in failures { print("FAIL: \(failure)") }
-        print("A=\(afterA) B=\(afterB) C=\(afterC) E=\(afterE)")
+        print("A=\(afterA) B=\(afterB) C=\(afterC) F=\(afterF) E=\(afterE)")
         print(failures.isEmpty ? "PASS" : "FAIL")
         exit(failures.isEmpty ? 0 : 1)
     }
