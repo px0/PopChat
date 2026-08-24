@@ -9,7 +9,11 @@ required itemId, items carry their required id):
 2. the second item's completion is REPLAYED — it must not duplicate;
 3. a third item fails mid-stream with a willRetry error and is re-delivered
    under a NEW item id — the aborted half must be dropped, never glued onto
-   the re-stream.
+   the re-stream;
+4. reasoning streams alongside, in two summary PARTS under one item id (they
+   must stay separate thoughts, not one run-on line), with a raw-reasoning
+   delta that must lose to the summary and an aborted thought that must be
+   dropped by the same willRetry rule as the answer.
 """
 import sys, json, time
 
@@ -23,6 +27,20 @@ def notify(method, params):
 def delta(item_id, text):
     notify("item/agentMessage/delta", {
         "threadId": "t1", "turnId": "u1", "itemId": item_id, "delta": text})
+
+def summary(item_id, index, text):
+    notify("item/reasoning/summaryTextDelta", {
+        "threadId": "t1", "turnId": "u1", "itemId": item_id,
+        "summaryIndex": index, "delta": text})
+
+def summary_part(item_id, index):
+    notify("item/reasoning/summaryPartAdded", {
+        "threadId": "t1", "turnId": "u1", "itemId": item_id, "summaryIndex": index})
+
+def raw_reasoning(item_id, text):
+    notify("item/reasoning/textDelta", {
+        "threadId": "t1", "turnId": "u1", "itemId": item_id,
+        "contentIndex": 0, "delta": text})
 
 def completed(item_id, text):
     notify("item/completed", {
@@ -47,17 +65,28 @@ for line in sys.stdin:
     elif method == "thread/inject_items":
         send({"id": mid, "result": {}})
     elif method == "turn/start":
+        summary("r1", 0, "Weighing ")
+        summary("r1", 0, "options.")
+        summary_part("r1", 1)
+        summary("r1", 1, "Now answering.")
+        raw_reasoning("r1", "RAW-MUST-NOT-SHOW")
         delta("m1", "A")
         completed("m1", "A")
         delta("m2", "B")
         completed("m2", "B")
         completed("m2", "B")   # replayed completion — must not duplicate
         delta("m3", "half-answer-the-retry-replaces")   # aborted attempt
+        summary("r9", 0, "ABORTED-THOUGHT")            # dropped with it
         notify("error", {
             "threadId": "t1", "turnId": "u1", "willRetry": True,
             "error": {"message": "response stream disconnected"}})
         delta("m4", "C")       # the retry re-delivers under a new id
         completed("m4", "C")
+        summary("r2", 0, "Weighing ")   # ...and re-delivers the thinking too
+        summary("r2", 0, "options.")
+        summary_part("r2", 1)
+        summary("r2", 1, "Now answering.")
+        raw_reasoning("r2", "RAW-MUST-NOT-SHOW")
         time.sleep(1.5)        # response arrives long after the first partial
         send({"id": mid, "result": {}})
         notify("turn/completed", {"turn": {"status": "completed"}})

@@ -212,14 +212,7 @@ enum MarkdownRenderer {
     }
 
     static func attributedProse(_ markdown: String, caret: NSColor? = nil) -> NSAttributedString {
-        let base: NSAttributedString
-        let cacheKey = "\(appearanceKey)|\(markdown)" as NSString
-        if let cached = proseCache.object(forKey: cacheKey) {
-            base = cached
-        } else {
-            base = buildProse(markdown)
-            proseCache.setObject(base, forKey: cacheKey)
-        }
+        let base = cached(proseCache, markdown) { buildProse(markdown) }
         guard let caret else { return base }
         let withCaret = NSMutableAttributedString(attributedString: base)
         withCaret.append(NSAttributedString(string: "▍", attributes: [
@@ -227,6 +220,55 @@ enum MarkdownRenderer {
             .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
         ]))
         return withCaret
+    }
+
+    private static let reasoningCache: NSCache<NSString, NSAttributedString> = {
+        let cache = NSCache<NSString, NSAttributedString>()
+        cache.countLimit = 64
+        return cache
+    }()
+
+    /// The model's thinking: the same markdown pass as prose, recolored to read
+    /// as subordinate to the answer.
+    ///
+    /// Markdown really is needed — reasoning summaries arrive with `**bold**`
+    /// section headings, and printing the asterisks looks worse than any styling
+    /// choice this could get wrong. Cached like `attributedProse` and keyed on
+    /// appearance for the same reason: a stable identity is what keeps
+    /// SelectableText's measurement cache hitting while a disclosure is open.
+    ///
+    /// COLOR ONLY. Scaling the fonts down afterwards was tried and reverted: the
+    /// paragraph styles `buildProse` attaches are sized for the fonts it chose,
+    /// and shrinking the fonts under them makes `boundingRect` under-report the
+    /// height — SelectableText then hands SwiftUI a frame one paragraph short
+    /// and the tail of the thinking is silently clipped. Subordination comes
+    /// from the secondary color, the indent rule, and being collapsed by
+    /// default; none of those touch metrics.
+    static func attributedReasoning(_ markdown: String) -> NSAttributedString {
+        cached(reasoningCache, markdown) {
+            let result = NSMutableAttributedString(attributedString: buildProse(markdown))
+            result.addAttribute(
+                .foregroundColor, value: NSColor.secondaryLabelColor,
+                range: NSRange(location: 0, length: result.length)
+            )
+            return result
+        }
+    }
+
+    /// Appearance-keyed memoization, shared by the render caches. Keeping them
+    /// as SEPARATE caches is deliberate: one cache would let streaming churn
+    /// evict an open reasoning disclosure's entry, and a rebuilt string is a new
+    /// identity — exactly the re-measure the caching exists to avoid.
+    private static func cached(
+        _ cache: NSCache<NSString, NSAttributedString>,
+        _ markdown: String,
+        build: () -> NSAttributedString
+    ) -> NSAttributedString {
+        let key = "\(appearanceKey)|\(markdown)" as NSString
+        if let hit = cache.object(forKey: key) { return hit }
+        let built = build()
+        cache.setObject(built, forKey: key)
+        return built
     }
 
     private static func buildProse(_ markdown: String) -> NSAttributedString {

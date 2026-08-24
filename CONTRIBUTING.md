@@ -34,6 +34,28 @@ POPCHAT_API_KEY=… .build/debug/PopChat --smoke-search       # tool-calling loo
 .build/debug/PopChat --smoke-history-search                 # cross-conversation full-text search
 ```
 
+Two harnesses cover the model's thinking, which reaches the transcript by a
+path nothing else uses:
+
+```sh
+.build/debug/PopChat --smoke-reasoning          # wire spellings, waiting-row window, metrics-neutral styling
+.build/debug/PopChat --smoke-reasoning-persist  # survives a reload, stays out of both search paths
+```
+
+`--smoke-reasoning-persist` exists because the SQLite store names the columns it
+writes by hand. A field added to `ChatMessage` is dropped in silence until
+someone names it in `StoredMessage` too — which is exactly what happened to
+`reasoning` the first time. If you add a field to a message, add it there and
+add a line here.
+
+Reasoning must also stay out of both search paths, and both are asserted: the
+FTS index is built from message text alone, and `⌘F` counts occurrences over
+text the transcript actually paints, which a collapsed disclosure does not. A
+hit in either would send you to a chat with nothing visibly matching.
+
+The check-list harnesses share `CheckLog` (`check` / `finish`) — add to it
+rather than re-declaring a local copy.
+
 `--smoke-history-bench` synthesizes a store and times what the launch path calls.
 Listing history must stay flat as the store grows: it reads metadata columns only,
 so neither message bodies nor attachment blobs are on that path. If it starts
@@ -56,7 +78,7 @@ Four harnesses drive a fake app-server instead of the real one, so they cost no 
 .build/debug/PopChat --smoke-codex-app-server-session      Tools/fake-codex-session
 ```
 
-They guard, in order: turn assembly and notification ordering (both agent messages must survive, the first delta must not wait on the `turn/start` response, a replayed `item/completed` must not duplicate its item, and a `willRetry` error must drop the aborted in-flight partial and surface a retry status rather than gluing the re-stream onto it in silence); recovery from a process that goes silent mid-turn; the rule that a process which stops draining its stdin cannot wedge PopChat — never hold a lock across the blocking write, or Stop and the watchdog both block behind it; and session reuse.
+They guard, in order: turn assembly and notification ordering (both agent messages must survive, the first delta must not wait on the `turn/start` response, a replayed `item/completed` must not duplicate its item, and a `willRetry` error must drop the aborted in-flight partial and surface a retry status rather than gluing the re-stream onto it in silence — plus the same three rules for reasoning: summary parts of one item stay separate thoughts, raw reasoning loses to a summary, and a retry drops the aborted thinking); recovery from a process that goes silent mid-turn; the rule that a process which stops draining its stdin cannot wedge PopChat — never hold a lock across the blocking write, or Stop and the watchdog both block behind it; and session reuse.
 
 That last one is worth explaining, because what it protects is invisible from the outside. `CodexAppServerBackend` keeps one `codex` process and one ephemeral thread alive across a conversation's turns, because the backend's prompt cache keys off the session: a reused thread reports most of its input cached, two fresh threads with an identical prefix report none. So a regression that quietly respawns per turn still produces correct answers — it just costs several times the tokens and seconds of extra latency, and no test that only reads the reply would notice. The harness counts protocol methods and pids instead: reuse sends one `thread/start` and no re-injection; a transcript that no longer matches what the thread was told rebuilds the thread but keeps the process; toggling web search (a launch argument) starts a new process; a `turnId`-less server must still stream; a turn cancelled via `turn/interrupt` must leave the child alive without its cancellation timer killing the turn that follows; and an idle session must retire its child. That last one matters because the store's staleness reset only runs when the panel is summoned — a conversation that is simply abandoned would otherwise leave `codex` resident indefinitely, so the backend's own idle timer is the only thing that retires it.
 

@@ -285,6 +285,14 @@ enum ConversationStore {
         var role: ChatRole
         var text: String
         var wireText: String?
+        /// The model's thinking, kept because the transcript redisplays it in
+        /// its collapsed disclosure after a reload. Optional, so rows written
+        /// before the column existed decode with nothing rather than fail.
+        ///
+        /// This projection is explicit rather than a whole-struct encode, which
+        /// means a field added to `ChatMessage` is dropped in silence until it
+        /// is named here — `--smoke-reasoning-persist` pins this one.
+        var reasoning: String?
         var attachments: [StoredAttachment]
 
         init(_ message: ChatMessage) {
@@ -292,6 +300,7 @@ enum ConversationStore {
             role = message.role
             text = message.text
             wireText = message.wireText
+            reasoning = message.reasoning
             attachments = message.attachments.map {
                 StoredAttachment(id: $0.id, filename: $0.filename, note: $0.note, noteKind: $0.noteKind)
             }
@@ -447,7 +456,8 @@ enum ConversationStore {
                 role: stored.role,
                 text: stored.text,
                 wireText: stored.wireText,
-                attachments: stored.attachments.compactMap { payloads[owner]?[$0.id] }
+                attachments: stored.attachments.compactMap { payloads[owner]?[$0.id] },
+                reasoning: stored.reasoning
             )
         }
     }

@@ -66,6 +66,7 @@ enum CodexResponsesClient {
         let instructions = systemTexts.isEmpty ? baseInstructions : systemTexts.joined(separator: "\n\n")
         var input = history.filter { $0.role != "system" }.map(inputItem(for:))
         var visible = ""
+        var reasoning = ""
         var executor: WebToolExecutor?
         if case .localTools(let engine) = webAccess {
             executor = WebToolExecutor(engine: engine)
@@ -92,6 +93,7 @@ enum CodexResponsesClient {
                     toolsEnabled: executor != nil,
                     forceFinal: roundsExhausted,
                     visiblePrefix: visible,
+                    reasoningPrefix: reasoning,
                     continuation: continuation
                 )
             } catch is CancellationError {
@@ -108,6 +110,7 @@ enum CodexResponsesClient {
             }
 
             visible = outcome.visibleText
+            reasoning = outcome.reasoningText
 
             // A truncated response terminates the turn with a visible warning,
             // regardless of any partial tool calls it may have carried.
@@ -181,6 +184,8 @@ enum CodexResponsesClient {
 
     private struct RoundOutcome {
         var visibleText: String
+        /// Summarized thinking accumulated across every round of this turn.
+        var reasoningText: String
         /// Raw output items to echo back as input on the next round (function
         /// calls and any reasoning items the backend requires to stay paired).
         var roundItems: [[String: Any]]
@@ -199,6 +204,7 @@ enum CodexResponsesClient {
         toolsEnabled: Bool,
         forceFinal: Bool,
         visiblePrefix: String,
+        reasoningPrefix: String,
         continuation: AsyncStream<ChatStreamEvent>.Continuation
     ) async throws -> RoundOutcome {
         var body: [String: Any] = [
@@ -259,6 +265,7 @@ enum CodexResponsesClient {
             return try await consumeStream(
                 bytes: bytes,
                 visiblePrefix: visiblePrefix,
+                reasoningPrefix: reasoningPrefix,
                 continuation: continuation
             )
         }
@@ -274,10 +281,12 @@ enum CodexResponsesClient {
     private static func consumeStream(
         bytes: URLSession.AsyncBytes,
         visiblePrefix: String,
+        reasoningPrefix: String,
         continuation: AsyncStream<ChatStreamEvent>.Continuation
     ) async throws -> RoundOutcome {
         var visible = visiblePrefix
         var roundText = ""
+        var reasoning = reasoningPrefix
         var roundItems: [[String: Any]] = []
         var toolCalls: [ToolCall] = []
 
@@ -311,6 +320,23 @@ enum CodexResponsesClient {
                     continuation.yield(.status("Reasoning…"))
                 }
 
+            // The request asks for `summary: "auto"`, so the backend streams a
+            // readable summary of the model's thinking. `…summary_text.delta`
+            // is the summarized form and `…reasoning_text.delta` the raw one;
+            // a given model emits one or the other, never both interleaved.
+            case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+                if let piece = event["delta"] as? String, !piece.isEmpty {
+                    reasoning += piece
+                    continuation.yield(.reasoning(reasoning))
+                }
+
+            // A new summary part is a paragraph break between thoughts, not
+            // more text — the blank line is the whole payload.
+            case "response.reasoning_summary_part.added":
+                if !reasoning.isEmpty, !reasoning.hasSuffix("\n\n") {
+                    reasoning += "\n\n"
+                }
+
             case "response.output_item.done":
                 guard var item = event["item"] as? [String: Any],
                       let itemType = item["type"] as? String else { break }
@@ -332,14 +358,17 @@ enum CodexResponsesClient {
                 }
 
             case "response.completed", "response.done":
-                return RoundOutcome(visibleText: visible, roundItems: roundItems, toolCalls: toolCalls)
+                return RoundOutcome(visibleText: visible, reasoningText: reasoning, roundItems: roundItems, toolCalls: toolCalls)
 
             case "response.incomplete":
                 // Truncated (output limit / content filter) — carry the reason out
                 // so the loop can surface a visible warning instead of presenting a
                 // cut-off answer as complete.
                 let reason = ((event["response"] as? [String: Any])?["incomplete_details"] as? [String: Any])?["reason"] as? String
-                return RoundOutcome(visibleText: visible, roundItems: roundItems, toolCalls: toolCalls, incompleteReason: reason ?? "unknown")
+                return RoundOutcome(
+                    visibleText: visible, reasoningText: reasoning,
+                    roundItems: roundItems, toolCalls: toolCalls, incompleteReason: reason ?? "unknown"
+                )
 
             case "response.failed":
                 let error = (event["response"] as? [String: Any])?["error"] as? [String: Any]
@@ -355,7 +384,7 @@ enum CodexResponsesClient {
             }
         }
         // Stream ended without a terminal event — keep whatever arrived.
-        return RoundOutcome(visibleText: visible, roundItems: roundItems, toolCalls: toolCalls)
+        return RoundOutcome(visibleText: visible, reasoningText: reasoning, roundItems: roundItems, toolCalls: toolCalls)
     }
 
     private static func truncationMessage(reason: String?) -> String {

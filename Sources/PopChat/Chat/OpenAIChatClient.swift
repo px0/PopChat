@@ -28,6 +28,12 @@ enum ChatStreamEvent {
     /// never persisted into the transcript — per-turn startup noise would
     /// clutter every conversation with gray rows.
     case status(String)
+    /// Accumulated reasoning/thinking text so far — a full snapshot like
+    /// `.partial`, not a delta. Kept separate from the answer: it is displayed
+    /// in a collapsed disclosure, is never echoed back to the model, and is not
+    /// searchable (⌘F counts occurrences over text the transcript actually
+    /// paints, and a collapsed disclosure paints none).
+    case reasoning(String)
     case done(String)
     case error(String)
     /// An `.error` whose cause was attributed — via structured error fields
@@ -196,6 +202,7 @@ enum OpenAIChatClient {
     ) async {
         var messages = history
         var visible = ""
+        var reasoning = ""
         var executor: WebToolExecutor?
         if case .localTools(let engine) = webAccess {
             executor = WebToolExecutor(engine: engine)
@@ -217,6 +224,7 @@ enum OpenAIChatClient {
                     webAccess: webAccess,
                     toolsDisabled: roundsExhausted,
                     visiblePrefix: visible,
+                    reasoningPrefix: reasoning,
                     continuation: continuation
                 )
             } catch is CancellationError {
@@ -234,6 +242,7 @@ enum OpenAIChatClient {
             }
 
             visible = outcome.visibleText
+            reasoning = outcome.reasoningText
 
             guard let executor, !outcome.toolCalls.isEmpty, !roundsExhausted else {
                 continuation.yield(.done(visible))
@@ -265,6 +274,10 @@ enum OpenAIChatClient {
     private struct RoundOutcome {
         var visibleText: String
         var roundText: String
+        /// Reasoning accumulated across every round of this turn — the tool loop
+        /// carries it forward so a second round's thinking appends to the first
+        /// round's instead of replacing it.
+        var reasoningText: String
         var toolCalls: [WireToolCall]
     }
 
@@ -274,7 +287,20 @@ enum OpenAIChatClient {
         var contentRejection: ContentCapability? = nil
     }
 
-    private struct StreamChunk: Decodable {
+    /// A string field some providers spell as an object (or null) instead.
+    /// Decoding it as a plain `String?` would throw, and since the whole chunk
+    /// is decoded with `try?`, that failure would silently drop the VISIBLE
+    /// content delta riding along in the same chunk. Tolerate the shape instead.
+    fileprivate struct LenientString: Decodable {
+        let value: String?
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            value = try? container.decode(String.self)
+        }
+    }
+
+    struct StreamChunk: Decodable {
         struct Choice: Decodable {
             struct Delta: Decodable {
                 struct ToolCallDelta: Decodable {
@@ -287,10 +313,17 @@ enum OpenAIChatClient {
                     let function: FunctionDelta?
                 }
                 let content: String?
+                /// Reasoning text has NO standard spelling: `reasoning_content`
+                /// is what DeepSeek and most OpenAI-compatible servers emit,
+                /// `reasoning` is OpenRouter's. Both are read; whichever the
+                /// provider sends wins (they never arrive together).
+                fileprivate let reasoningContent: LenientString?
+                fileprivate let reasoning: LenientString?
                 let toolCalls: [ToolCallDelta]?
 
                 enum CodingKeys: String, CodingKey {
-                    case content
+                    case content, reasoning
+                    case reasoningContent = "reasoning_content"
                     case toolCalls = "tool_calls"
                 }
             }
@@ -305,12 +338,41 @@ enum OpenAIChatClient {
         let choices: [Choice]?
     }
 
+    /// One SSE line's payload, already mapped off the wire's several spellings.
+    struct StreamDelta {
+        var content: String?
+        var reasoning: String?
+        var toolCalls: [StreamChunk.Choice.Delta.ToolCallDelta] = []
+        /// The terminal `data: [DONE]` sentinel.
+        var isDone = false
+    }
+
+    /// SSE line → delta. Its own function so `--smoke-reasoning` can assert the
+    /// field mapping without a live provider: neither reasoning spelling is part
+    /// of the OpenAI schema, so a decoding regression would look exactly like
+    /// "this model doesn't think" rather than like a bug.
+    static func decodeDelta(line: String) -> StreamDelta? {
+        guard line.hasPrefix("data:") else { return nil }
+        let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+        if payload == "[DONE]" { return StreamDelta(isDone: true) }
+        guard let data = payload.data(using: .utf8),
+              let chunk = try? JSONDecoder().decode(StreamChunk.self, from: data),
+              let choice = chunk.choices?.first else { return nil }
+        let reasoning = choice.delta?.reasoningContent?.value ?? choice.delta?.reasoning?.value
+        return StreamDelta(
+            content: choice.delta?.content,
+            reasoning: (reasoning?.isEmpty ?? true) ? nil : reasoning,
+            toolCalls: choice.delta?.toolCalls ?? []
+        )
+    }
+
     private static func streamOneRound(
         messages: [WireMessage],
         config: ProviderConfig,
         webAccess: WebAccess?,
         toolsDisabled: Bool,
         visiblePrefix: String,
+        reasoningPrefix: String,
         continuation: AsyncStream<ChatStreamEvent>.Continuation
     ) async throws -> RoundOutcome {
         guard var url = URL(string: config.baseURL) else {
@@ -363,17 +425,14 @@ enum OpenAIChatClient {
 
         var visible = visiblePrefix
         var roundText = ""
+        var reasoning = reasoningPrefix
         var pendingCalls: [Int: (id: String, name: String, arguments: String)] = [:]
 
         for try await line in bytes.lines {
-            guard line.hasPrefix("data:") else { continue }
-            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" { break }
-            guard let data = payload.data(using: .utf8),
-                  let chunk = try? JSONDecoder().decode(StreamChunk.self, from: data),
-                  let choice = chunk.choices?.first else { continue }
+            guard let delta = decodeDelta(line: line) else { continue }
+            if delta.isDone { break }
 
-            if let piece = choice.delta?.content, !piece.isEmpty {
+            if let piece = delta.content, !piece.isEmpty {
                 if roundText.isEmpty && !visible.isEmpty {
                     visible += "\n\n"
                 }
@@ -381,19 +440,26 @@ enum OpenAIChatClient {
                 visible += piece
                 continuation.yield(.partial(visible))
             }
-            for delta in choice.delta?.toolCalls ?? [] {
-                var call = pendingCalls[delta.index] ?? (id: "", name: "", arguments: "")
-                if let id = delta.id { call.id = id }
-                if let name = delta.function?.name { call.name += name }
-                if let fragment = delta.function?.arguments { call.arguments += fragment }
-                pendingCalls[delta.index] = call
+            if let piece = delta.reasoning {
+                reasoning += piece
+                continuation.yield(.reasoning(reasoning))
+            }
+            for call in delta.toolCalls {
+                var pending = pendingCalls[call.index] ?? (id: "", name: "", arguments: "")
+                if let id = call.id { pending.id = id }
+                if let name = call.function?.name { pending.name += name }
+                if let fragment = call.function?.arguments { pending.arguments += fragment }
+                pendingCalls[call.index] = pending
             }
         }
 
         let toolCalls = pendingCalls.sorted { $0.key < $1.key }.map { _, call in
             WireToolCall(id: call.id, function: .init(name: call.name, arguments: call.arguments))
         }
-        return RoundOutcome(visibleText: visible, roundText: roundText, toolCalls: toolCalls)
+        return RoundOutcome(
+            visibleText: visible, roundText: roundText,
+            reasoningText: reasoning, toolCalls: toolCalls
+        )
     }
 
     // MARK: - Capability attribution

@@ -17,6 +17,12 @@ struct ChatMessage: Identifiable, Equatable, Codable {
     /// (slash-command expansion). Nil means `text` is the wire text.
     var wireText: String?
     var attachments: [Attachment] = []
+    /// The model's thinking for an assistant turn, when the provider streams it.
+    /// Persisted with the message (so reopening a chat keeps it) but never sent
+    /// back: chat-completions history carries the answer only, and echoing a
+    /// summary as if the model had said it would corrupt the next turn.
+    /// Optional so conversations written before this existed still decode.
+    var reasoning: String?
 }
 
 @MainActor
@@ -28,6 +34,11 @@ final class ChatStore: ObservableObject {
     /// the moment visible text arrives and at the end of every turn — it must
     /// never outlive the wait it describes.
     @Published private(set) var pendingStatus: String?
+    /// The turn's thinking so far, while the reply is still empty — what the
+    /// waiting row scrolls. Same lifecycle as `pendingStatus` (transient,
+    /// empty-row-only, cleared on first text / turn end / stop); the durable
+    /// copy is committed to `ChatMessage.reasoning` separately.
+    @Published private(set) var pendingReasoning: String?
     @Published private(set) var recent: [ConversationMeta] = []
     private(set) var conversationID = UUID()
 
@@ -363,15 +374,37 @@ final class ChatStore: ObservableObject {
         streamTask = Task {
             // The streaming assistant row stays last; activity rows are inserted above it.
             var assistantIndex = messages.count - 1
+            var reasoning = ""
+            var reasoningShown = false
             for await event in stream {
                 switch event {
                 case .partial(let text), .done(let text):
                     streamTarget = text
-                    // The wait this described is over — real text is arriving.
-                    if !text.isEmpty { pendingStatus = nil }
+                    // The wait these described is over — real text is arriving.
+                    if !text.isEmpty {
+                        pendingStatus = nil
+                        pendingReasoning = nil
+                        // Hand the thinking over to the message's own disclosure
+                        // as the waiting row stops showing it, so it stays
+                        // visible for the whole answer rather than reappearing
+                        // when the turn ends. Once per turn, not per chunk.
+                        if !reasoning.isEmpty, !reasoningShown {
+                            reasoningShown = true
+                            commit(reasoning: reasoning, to: assistantMessage.id)
+                        }
+                    }
                     startDrain(messageID: assistantMessage.id, mode: typewriter)
                 case .status(let text):
                     pendingStatus = text
+                case .reasoning(let text):
+                    // The visible copy: a plain @Published string, NOT a write
+                    // into `messages`. Publishing the array per chunk would
+                    // COW-copy it and re-diff every row many times a second; the
+                    // waiting row is the only thing that reads this, and it is
+                    // Equatable-gated to itself. The durable copy is committed
+                    // once, where the answer takes over.
+                    reasoning = text
+                    pendingReasoning = text
                 case .activity(let text):
                     messages.insert(ChatMessage(role: .activity, text: text), at: assistantIndex)
                     assistantIndex += 1
@@ -407,6 +440,7 @@ final class ChatStore: ObservableObject {
             // had actually arrived.
             isStreaming = false
             pendingStatus = nil
+            pendingReasoning = nil
             await drainTask?.value
             // "Still ours": flushTypewriter() clears streamingMessageID when a new
             // turn takes over mid-reveal, so this must not clobber its bookkeeping.
@@ -422,12 +456,24 @@ final class ChatStore: ObservableObject {
                     messages.remove(at: index)
                 } else {
                     messages[index].text = finalText
+                    // The turn's final thinking. Also runs on Stop (cancelling
+                    // the stream ends the loop, not the tail), so a stopped turn
+                    // keeps the reasoning it had produced, and it picks up
+                    // anything a tool loop thought after the first text.
+                    if !reasoning.isEmpty { messages[index].reasoning = reasoning }
                 }
             }
             if stillOurs { streamingMessageID = nil }
             streamEndedAt = Date()
             persist()
         }
+    }
+
+    /// Writes a turn's thinking onto its assistant row, by id — a new turn can
+    /// already have appended rows by the time this runs.
+    private func commit(reasoning: String, to messageID: UUID) {
+        guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
+        messages[index].reasoning = reasoning
     }
 
     /// Typewriter reveal speed. The per-tick step is this divided by the tick rate,
@@ -703,9 +749,10 @@ final class ChatStore: ObservableObject {
         // for the same thing.
         backend?.cancelTurn()
         streamTask?.cancel()
-        // Don't wait for the cancelled task's tail to clear it — the waiting row
-        // must not keep pulsing "Reasoning…" after the user said stop.
+        // Don't wait for the cancelled task's tail to clear these — the waiting
+        // row must not keep pulsing "Reasoning…" after the user said stop.
         pendingStatus = nil
+        pendingReasoning = nil
         flushTypewriter()
     }
 

@@ -311,6 +311,12 @@ struct ChatView: View {
                             let waiting: String? = id == streamingID && message.text.isEmpty
                                 ? (store.pendingStatus ?? "Thinking…")
                                 : nil
+                            // Nil for every row but that same one, so the
+                            // thinking arriving at wire rate repaints exactly
+                            // one row (the `find` gating trick again).
+                            let waitingReasoning: String? = waiting == nil
+                                ? nil
+                                : store.pendingReasoning
                             // Nil for every row but the one unattributed-failure
                             // error row (same gating trick again).
                             let capabilityAction: MessageRow.CapabilityAction? =
@@ -331,6 +337,7 @@ struct ChatView: View {
                                 find: rowFind,
                                 reveal: revealing ? revealFade : nil,
                                 waitingStatus: waiting,
+                                waitingReasoning: waitingReasoning,
                                 capabilityAction: capabilityAction,
                                 onFork: { store.fork(at: id) },
                                 fullText: { store.fullText(of: id) },
@@ -671,6 +678,9 @@ private struct MessageRow: View, Equatable {
     /// waiting indicator pulses ("Thinking…", or the provider's latest `.status`).
     /// Part of == so a status change repaints exactly this row.
     var waitingStatus: String?
+    /// Non-nil only for that same row once thinking has arrived: the text the
+    /// waiting indicator scrolls. Part of == so it repaints only this row.
+    var waitingReasoning: String?
     /// Non-nil only for the error row of an unattributed send failure that
     /// carried image/file parts: the "don't send X to this model again" manual
     /// exception, offered where the problem appeared. Part of ==.
@@ -682,6 +692,7 @@ private struct MessageRow: View, Equatable {
     var capabilityAction: CapabilityAction?
     /// Ignored by ==: it captures only stable references (store + message id).
     var onFork: () -> Void = {}
+    /// Likewise ignored by ==.
     /// Likewise ignored by ==. Resolves at click time to the text that has
     /// ARRIVED, which differs from `message.text` while the typewriter is still
     /// revealing this row — Copy promises the whole response.
@@ -706,6 +717,7 @@ private struct MessageRow: View, Equatable {
             && lhs.find == rhs.find
             && lhs.reveal == rhs.reveal
             && lhs.waitingStatus == rhs.waitingStatus
+            && lhs.waitingReasoning == rhs.waitingReasoning
             && lhs.capabilityAction == rhs.capabilityAction
             && abs(lhs.bubbleMaxWidth - rhs.bubbleMaxWidth) < 0.5
     }
@@ -714,35 +726,38 @@ private struct MessageRow: View, Equatable {
         switch message.role {
         case .user:
             let style = BubbleStyle(rawValue: bubbleStyleRaw) ?? .accentTint
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-                VStack(alignment: .trailing, spacing: 4) {
-                    if !message.attachments.isEmpty {
-                        ForEach(message.attachments) { attachment in
-                            Label(attachment.filename, systemImage: "paperclip")
-                                .font(.system(size: 11))
-                                .foregroundStyle(style == .accentFill
-                                    ? Theme.contrastingForeground(on: accentHex).opacity(0.75)
-                                    : Color.secondary)
+            VStack(alignment: .trailing, spacing: 4) {
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    VStack(alignment: .trailing, spacing: 4) {
+                        if !message.attachments.isEmpty {
+                            ForEach(message.attachments) { attachment in
+                                Label(attachment.filename, systemImage: "paperclip")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(style == .accentFill
+                                        ? Theme.contrastingForeground(on: accentHex).opacity(0.75)
+                                        : Color.secondary)
+                            }
+                        }
+                        if !message.text.isEmpty {
+                            SelectableText(
+                                attributed: MarkdownRenderer.plain(
+                                    message.text,
+                                    color: Theme.bubbleForegroundNSColor(style: style, accentHex: accentHex)
+                                ),
+                                find: textFind
+                            )
                         }
                     }
-                    if !message.text.isEmpty {
-                        SelectableText(
-                            attributed: MarkdownRenderer.plain(
-                                message.text,
-                                color: Theme.bubbleForegroundNSColor(style: style, accentHex: accentHex)
-                            ),
-                            find: textFind
-                        )
-                    }
+                    .padding(.vertical, 9)
+                    .padding(.horizontal, 14)
+                    .background(
+                        Theme.bubbleFill(style: style, accentHex: accentHex, dark: scheme == .dark),
+                        in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    )
+                    .frame(maxWidth: bubbleMaxWidth, alignment: .trailing)
                 }
-                .padding(.vertical, 9)
-                .padding(.horizontal, 14)
-                .background(
-                    Theme.bubbleFill(style: style, accentHex: accentHex, dark: scheme == .dark),
-                    in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-                )
-                .frame(maxWidth: bubbleMaxWidth, alignment: .trailing)
+                .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
@@ -751,10 +766,17 @@ private struct MessageRow: View, Equatable {
             // tens of seconds — which reads as a frozen app. Pulse a status
             // instead until real text arrives.
             if let waitingStatus, message.text.isEmpty {
-                WaitingIndicator(status: waitingStatus)
+                WaitingIndicator(status: waitingStatus, reasoning: waitingReasoning)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 VStack(alignment: .leading, spacing: 4) {
+                    // Only reachable once the answer has text, because the empty
+                    // streaming row takes the branch above — so a reasoning
+                    // stream never re-measures a text view while it arrives, and
+                    // collapsed (the default) this renders no text view at all.
+                    if let reasoning = message.reasoning, !reasoning.isEmpty {
+                        ReasoningDisclosure(text: reasoning)
+                    }
                     AssistantMessageView(
                         text: message.text, showCaret: showCaret, find: find, reveal: reveal
                     )
@@ -842,6 +864,57 @@ private struct MessageRow: View, Equatable {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+
+}
+
+/// The model's thinking, collapsed by default: a chat panel is for the answer,
+/// and reasoning summaries routinely run longer than the reply they precede.
+///
+/// Expansion is local state, so opening one row never touches another; and the
+/// row only reaches this view once the answer has text (an empty streaming row
+/// renders the waiting indicator instead), so nothing here re-measures while
+/// reasoning is still arriving.
+private struct ReasoningDisclosure: View {
+    let text: String
+
+    @State private var expanded = false
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Image(systemName: "brain")
+                        .font(.system(size: 10))
+                    Text("Reasoning")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(expanded ? "Hide the model's thinking" : "Show the model's thinking")
+            if expanded {
+                SelectableText(attributed: MarkdownRenderer.attributedReasoning(text))
+                    .padding(.leading, 10)
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(Theme.liftedBorder(dark: scheme == .dark))
+                            .frame(width: 1)
+                    }
+                    // The rule ends where the thinking does; without this the
+                    // last line butts straight into the answer below it.
+                    .padding(.bottom, 6)
+            }
+        }
+    }
 }
 
 /// What an empty streaming row shows while the network turn has produced no text
@@ -849,30 +922,191 @@ private struct MessageRow: View, Equatable {
 /// an elapsed counter. The pulse is a repeatForever opacity animation — CA-driven
 /// per the caret rule, so no tick ever re-evaluates SwiftUI. Replaced by the
 /// normal caret/text rendering the moment the first characters commit.
-private struct WaitingIndicator: View {
+struct WaitingIndicator: View {
     let status: String
+    /// The model's thinking so far. When it is present the row shows a scrolling
+    /// window onto it instead of the bare status — a reasoning model can spend a
+    /// minute here, and one truncated line wastes the most interesting thing on
+    /// screen.
+    var reasoning: String?
+
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
     @State private var pulsing = false
     @State private var startedAt = Date()
+    @State private var expanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Visible lines of thinking, collapsed and expanded. Both are FIXED — the
+    /// text scrolls inside the window rather than growing it, which is what
+    /// keeps a token arriving from reflowing the transcript. (The old
+    /// single-line status relied on `lineLimit(1)` for the same reason; a fixed
+    /// window gets it structurally, and shows two more lines.)
+    static let collapsedLines = 3
+    static let expandedLines = 12
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(Theme.color(accentHex))
-                .frame(width: 7, height: 7)
-                .opacity(pulsing ? 0.25 : 1)
-            Text(status)
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
-                .opacity(pulsing ? 0.55 : 1)
-            ElapsedLabel(since: startedAt)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Theme.color(accentHex))
+                    .frame(width: 7, height: 7)
+                    .opacity(pulsing ? 0.25 : 1)
+                Text(thinking ? "Thinking" : status)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .opacity(pulsing ? 0.55 : 1)
+                ElapsedLabel(since: startedAt)
+                    .fixedSize()
+                if thinking {
+                    Spacer(minLength: 4)
+                    Button {
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                            expanded.toggle()
+                        }
+                    } label: {
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(expanded ? "Show less thinking" : "Show more thinking")
+                }
+            }
+            if let reasoning, thinking {
+                ThinkingScroller(
+                    text: reasoning,
+                    lines: expanded ? Self.expandedLines : Self.collapsedLines
+                )
+                // Same top fade the transcript uses under the pills: a window
+                // onto scrolling text otherwise cuts the line above in half.
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .black, location: 0.22),
+                            .init(color: .black, location: 1),
+                        ],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                )
+            }
         }
         .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear {
             withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
                 pulsing = true
             }
         }
+    }
+
+    private var thinking: Bool {
+        !(reasoning ?? "").isEmpty
+    }
+}
+
+/// A fixed-height window onto text that is still arriving, which follows the
+/// end as it grows.
+///
+/// AppKit-backed for the same reason the composer is: this updates at wire rate
+/// (50–150 chunks/s from a reasoning model), and a SwiftUI `Text` would re-measure
+/// the whole accumulated string every time. Here the height is a constant the
+/// caller picks, so SwiftUI never measures the content at all — and the text
+/// view is APPENDED to rather than rebuilt, since each update carries the same
+/// string plus a suffix.
+struct ThinkingScroller: NSViewRepresentable {
+    let text: String
+    var lines: Int
+
+    static let font = NSFont.systemFont(ofSize: 11.5)
+    /// The exact height `lines` of this font occupy — the harness pins the view
+    /// to it, since a window that grows with its content is the whole bug.
+    static func height(lines: Int) -> CGFloat {
+        ceil(NSLayoutManager().defaultLineHeight(for: font)) * CGFloat(lines) + 4
+    }
+
+    final class Coordinator {
+        var shown = ""
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 0, height: 2)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.setAccessibilityLabel("Model thinking")
+
+        let scroll = NSScrollView()
+        scroll.documentView = textView
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        // Drops fall through to the panel-wide attachment target.
+        textView.unregisterDraggedTypes()
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let textView = scroll.documentView as? NSTextView else { return }
+        let shown = context.coordinator.shown
+        guard text != shown else { return }
+
+        // Whether to follow is decided BEFORE the append: a user who scrolled up
+        // to read is reading, and yanking them back is the transcript's own rule.
+        let following = context.coordinator.shown.isEmpty || isAtBottom(scroll)
+        if text.hasPrefix(shown) {
+            textView.textStorage?.append(rendered(String(text.dropFirst(shown.count))))
+        } else {
+            textView.textStorage?.setAttributedString(rendered(text))
+        }
+        context.coordinator.shown = text
+        // Unanimated, per the follow-scroll rule: at this update rate an
+        // animation would restart every tick and layout would never settle.
+        if following { textView.scrollToEndOfDocument(nil) }
+    }
+
+    private func isAtBottom(_ scroll: NSScrollView) -> Bool {
+        let visible = scroll.contentView.bounds
+        let total = scroll.documentView?.frame.height ?? 0
+        return total <= visible.height || visible.maxY >= total - 8
+    }
+
+    /// Emphasis markers are dropped as the text arrives — reasoning summaries
+    /// arrive with `**bold**` section headings, and a live feed showing the
+    /// asterisks looks broken.
+    ///
+    /// Stripped per APPENDED CHUNK, not over the whole trace: this runs at wire
+    /// rate, so anything O(accumulated text) here is O(n²) over a turn. That
+    /// rules out a real markdown pass (the settled copy gets one — see
+    /// `MarkdownRenderer.attributedReasoning`, which the disclosure uses once
+    /// the answer arrives) and it is why `_` is left alone: character-wise
+    /// stripping cannot tell emphasis from an identifier, and `snake_case` in a
+    /// thought is likelier than underscore emphasis.
+    static func stripEmphasis(_ chunk: String) -> String {
+        String(chunk.filter { $0 != "*" && $0 != "`" && $0 != "#" })
+    }
+
+    private func rendered(_ string: String) -> NSAttributedString {
+        NSAttributedString(string: Self.stripEmphasis(string), attributes: [
+            .font: Self.font,
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 320, height: Self.height(lines: lines))
     }
 }
 

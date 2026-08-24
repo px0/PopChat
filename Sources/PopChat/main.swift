@@ -25,6 +25,7 @@ if smokePlain || smokeSearch || smokePasteable {
                 : "Reply with exactly: PopChat streaming OK"
         print("smoke: \(config.baseURL) model=\(config.model) search=\(smokeSearch) pasteable=\(smokePasteable)")
         var chunks = 0
+        var reasoningChunks = 0
         var history = [OpenAIChatClient.WireMessage(role: "user", content: .text(prompt))]
         if smokePasteable {
             history.insert(
@@ -40,6 +41,10 @@ if smokePlain || smokeSearch || smokePasteable {
             switch event {
             case .partial:
                 chunks += 1
+            case .reasoning:
+                // Counted, not printed: a reasoning model emits a snapshot per
+                // chunk, which would bury the answer these harnesses are reading.
+                reasoningChunks += 1
             case .activity(let text):
                 print("[activity] \(text)")
             case .status(let text):
@@ -356,7 +361,7 @@ if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
                         // labeling bug: the begin event has no query.
                         if value.trimmingCharacters(in: .whitespaces).hasSuffix(":") { emptyQuery = true }
                     }
-                case .status: break
+                case .status, .reasoning: break
                 case .error(let value): failure = value
                 case .contentRejected(_, let value): failure = value
                 }
@@ -411,6 +416,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
         var sawAborted = false
         var sawGlued = false
         var sawRetryStatus = false
+        var reasoning = ""
         let config = ProviderConfig(
             baseURL: "", apiKey: "", model: "fake-model",
             kind: .codexAppServer
@@ -431,6 +437,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
                 final = text
             case .status(let text):
                 if text.localizedCaseInsensitiveContains("retrying") { sawRetryStatus = true }
+            case .reasoning(let text):
+                reasoning = text
             case .activity:
                 break
             case .error(let message):
@@ -444,12 +452,20 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
         // final == exactly the three items: the replayed completion of B would
         // make it four, and the aborted "half-answer…" partial must have been
         // streamed (sawAborted) but dropped rather than glued to C (sawGlued).
+        // Two summary PARTS under one item id, joined by the blank line their
+        // part break announces (folding them into one entry would run them
+        // together as "options.Now"), the raw-reasoning delta loses to the
+        // summary, and the retried attempt's thinking is dropped rather than
+        // glued to what replaces it.
+        let expectedReasoning = "Weighing options.\n\nNow answering."
+        let reasoningOK = reasoning == expectedReasoning
         let passed = failure == nil && final == "A\n\nB\n\nC" && lead > 1.0
-            && sawAborted && !sawGlued && sawRetryStatus
+            && sawAborted && !sawGlued && sawRetryStatus && reasoningOK
         print(String(
-            format: "first-partial=%.3fs lead=%.3fs aborted=%@ glued=%@ retry-status=%@ final=%@ %@",
+            format: "first-partial=%.3fs lead=%.3fs aborted=%@ glued=%@ retry-status=%@ reasoning=%@ final=%@ %@",
             delay, lead,
             sawAborted ? "yes" : "no", sawGlued ? "yes" : "no", sawRetryStatus ? "yes" : "no",
+            reasoning.replacingOccurrences(of: "\n", with: "\\n"),
             final.replacingOccurrences(of: "\n", with: "\\n"),
             passed ? "PASS" : "FAIL"
         ))
@@ -827,6 +843,7 @@ if CommandLine.arguments.contains("--smoke-chatgpt") {
             ? "What is the latest stable release version of the Zed editor? Use web_search to check — do not answer from memory. Reply with just the version number and the source URL."
             : "Reply with exactly: PopChat ChatGPT OK"
         var chunks = 0
+        var reasoningChunks = 0
         let history = [OpenAIChatClient.WireMessage(role: "user", content: .text(prompt))]
         for await event in CodexResponsesClient.run(
             history: history,
@@ -836,6 +853,10 @@ if CommandLine.arguments.contains("--smoke-chatgpt") {
             switch event {
             case .partial:
                 chunks += 1
+            case .reasoning:
+                // Counted, not printed: a reasoning model emits a snapshot per
+                // chunk, which would bury the answer these harnesses are reading.
+                reasoningChunks += 1
             case .activity(let text):
                 print("[activity] \(text)")
             case .status(let text):
@@ -1046,6 +1067,151 @@ if CommandLine.arguments.contains("--smoke-history-bench") {
                  list.count, ConversationStore.count(), resumed?.messages.count ?? -1))
     if keptDirectory == nil { try? FileManager.default.removeItem(at: scratch) }
     exit(0)
+}
+
+/// Shared by the check-list harnesses: one line per claim, then a verdict and
+/// an exit code. Add to this rather than re-declaring a local copy.
+struct CheckLog {
+    private(set) var failures: [String] = []
+
+    mutating func check(
+        _ label: String, _ condition: Bool, _ detail: @autoclosure () -> String = ""
+    ) {
+        print("  \(condition ? "ok  " : "FAIL") \(label)\(condition ? "" : " — \(detail())")")
+        if !condition { failures.append(label) }
+    }
+
+    /// Prints the verdict and exits with it — every one of these harnesses ends
+    /// this way.
+    func finish() -> Never {
+        print(failures.isEmpty ? "PASS" : "FAIL (\(failures.count))")
+        exit(failures.isEmpty ? 0 : 1)
+    }
+}
+
+// Reasoning: the wire spellings, and the waiting row's line (no network, no UI).
+if CommandLine.arguments.contains("--smoke-reasoning") {
+    var log = CheckLog()
+    func line(_ json: String) -> String { "data: \(json)" }
+
+    // Neither spelling is in the OpenAI schema, so a decoding regression looks
+    // exactly like "this model doesn't think" rather than like a bug — which is
+    // why both are pinned here.
+    let deepseek = OpenAIChatClient.decodeDelta(line: line(
+        #"{"choices":[{"delta":{"reasoning_content":"weighing it"}}]}"#))
+    log.check("reasoning_content decodes", deepseek?.reasoning == "weighing it",
+          "got=\(String(describing: deepseek?.reasoning))")
+    let openrouter = OpenAIChatClient.decodeDelta(line: line(
+        #"{"choices":[{"delta":{"reasoning":"weighing it"}}]}"#))
+    log.check("reasoning decodes", openrouter?.reasoning == "weighing it",
+          "got=\(String(describing: openrouter?.reasoning))")
+    let content = OpenAIChatClient.decodeDelta(line: line(
+        #"{"choices":[{"delta":{"content":"hello"}}]}"#))
+    log.check("content still decodes", content?.content == "hello" && content?.reasoning == nil)
+
+    // The whole chunk is decoded with `try?`, so a provider that spells
+    // `reasoning` as an object would take the VISIBLE text down with it.
+    let objectShaped = OpenAIChatClient.decodeDelta(line: line(
+        #"{"choices":[{"delta":{"content":"hello","reasoning":{"summary":"x"}}}]}"#))
+    log.check("an object-shaped reasoning field does not eat the content",
+          objectShaped?.content == "hello", "got=\(String(describing: objectShaped?.content))")
+    let nullShaped = OpenAIChatClient.decodeDelta(line: line(
+        #"{"choices":[{"delta":{"content":"hi","reasoning":null}}]}"#))
+    log.check("a null reasoning field does not eat the content", nullShaped?.content == "hi")
+    log.check("empty reasoning is not reported", OpenAIChatClient.decodeDelta(line: line(
+        #"{"choices":[{"delta":{"reasoning":""}}]}"#))?.reasoning == nil)
+
+    log.check("tool calls still decode", OpenAIChatClient.decodeDelta(line: line(
+        #"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"web_search"}}]}}]}"#)
+    )?.toolCalls.first?.function?.name == "web_search")
+    log.check("[DONE] is the sentinel", OpenAIChatClient.decodeDelta(line: "data: [DONE]")?.isDone == true)
+    log.check("non-data lines are skipped", OpenAIChatClient.decodeDelta(line: "event: ping") == nil)
+
+    // The waiting row shows thinking through a FIXED window that scrolls, so a
+    // chunk arriving can never change the row's height. That is the
+    // transcript-reflow rule the old one-line status enforced with
+    // lineLimit(1); a sized window gets it structurally, and shows two more
+    // lines. Measured through a real hosting view, not from the constants —
+    // the constants agreeing with themselves proves nothing.
+    MainActor.assumeIsolated {
+        func renderedHeight(_ text: String, lines: Int) -> CGFloat {
+            let host = NSHostingView(
+                rootView: ThinkingScroller(text: text, lines: lines).frame(width: 300)
+            )
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize.height
+        }
+        let collapsed = WaitingIndicator.collapsedLines
+        let oneLine = renderedHeight("a short thought", lines: collapsed)
+        let huge = renderedHeight(
+            String(repeating: "a much longer thought that wraps many times. ", count: 400),
+            lines: collapsed
+        )
+        log.check("the thinking window's height ignores its content", oneLine == huge,
+                  "short=\(oneLine) long=\(huge)")
+        log.check("three lines is taller than one",
+                  oneLine > renderedHeight("a short thought", lines: 1))
+        log.check("expanding shows more",
+                  renderedHeight("a short thought", lines: WaitingIndicator.expandedLines) > oneLine)
+    }
+
+    // Reasoning renders through the same SelectableText that measures itself
+    // with boundingRect, so its styling has to be metrics-neutral. It is not a
+    // theoretical rule: scaling the fonts down under the paragraph styles
+    // buildProse chose made the measurement come up one paragraph short, and
+    // the tail of the thinking was clipped with nothing to indicate it.
+    let sample = "**Heading**\n\nFirst thought about the problem.\n\nSecond thought.\n\nThird thought."
+    func height(_ string: NSAttributedString) -> CGFloat {
+        string.boundingRect(
+            with: NSSize(width: 320, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height
+    }
+    let reasoned = MarkdownRenderer.attributedReasoning(sample)
+    log.check("reasoning parses markdown", !reasoned.string.contains("**"), "got=\(reasoned.string.debugDescription)")
+    log.check("reasoning keeps every paragraph", reasoned.string.contains("Third thought"))
+    let delta = abs(height(MarkdownRenderer.attributedProse(sample)) - height(reasoned))
+    log.check("reasoning styling is metrics-neutral", delta < 0.5, "height delta=\(delta)")
+
+    log.finish()
+}
+
+// Reasoning has to survive a reload, and the SQLite store lists the columns it
+// writes by hand — so a field added to ChatMessage is dropped in silence until
+// someone names it there. That is exactly what happened to this one.
+//   .build/debug/PopChat --smoke-reasoning-persist
+if CommandLine.arguments.contains("--smoke-reasoning-persist") {
+    let scratch = FileManager.default.temporaryDirectory
+        .appendingPathComponent("popchat-reasonpersist-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    ConversationStore.overrideDirectory = scratch
+    var log = CheckLog()
+
+    let id = UUID()
+    ConversationStore.save(Conversation(
+        id: id, title: "thinker", updatedAt: Date(),
+        messages: [
+            ChatMessage(role: .user, text: "question"),
+            ChatMessage(role: .assistant, text: "answer", reasoning: "SECRETTHOUGHT"),
+        ]
+    ))
+    log.check("reasoning survives the round trip",
+          ConversationStore.load(id: id)?.messages.last?.reasoning == "SECRETTHOUGHT",
+          "got=\(String(describing: ConversationStore.load(id: id)?.messages.last?.reasoning))")
+    log.check("a message without thinking stays without it",
+          ConversationStore.load(id: id)?.messages.first?.reasoning == nil)
+
+    // It is displayed behind a collapsed disclosure, so it must not be
+    // searchable: a hit there sends you to a chat with nothing visibly matching.
+    log.check("reasoning is not in the full-text index",
+          ConversationStore.search("SECRETTHOUGHT", limit: 10).isEmpty)
+    log.check("the conversation IS indexed", ConversationStore.search("question", limit: 10).map(\.id) == [id])
+    log.check("⌘F does not count reasoning either",
+          !MarkdownRenderer.searchableStrings(
+              for: ChatMessage(role: .assistant, text: "answer", reasoning: "SECRETTHOUGHT")
+          ).joined().contains("SECRETTHOUGHT"))
+
+    try? FileManager.default.removeItem(at: scratch)
+    log.finish()
 }
 
 // Cross-conversation full-text search (no network, no UI):
