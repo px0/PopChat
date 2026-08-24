@@ -1189,7 +1189,7 @@ if let flagIndex = CommandLine.arguments.firstIndex(of: "--smoke-file"),
 
 /// Synthetic long-form conversation (prose/code/table/list/math) written into a
 /// scratch store, so UI harnesses are deterministic and never touch real history.
-func installBenchmarkConversation(minLength: Int) -> URL {
+func installBenchmarkConversation(minLength: Int) -> (scratch: URL, id: UUID) {
     let scratch = FileManager.default.temporaryDirectory
         .appendingPathComponent("popchat-bench-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
     ConversationStore.overrideDirectory = scratch
@@ -1215,8 +1215,9 @@ func installBenchmarkConversation(minLength: Int) -> URL {
     """
     var long = ""
     while long.count < minLength { long += block }
+    let id = UUID()
     ConversationStore.save(Conversation(
-        id: UUID(),
+        id: id,
         title: "ui benchmark",
         updatedAt: Date(),
         messages: [
@@ -1224,12 +1225,15 @@ func installBenchmarkConversation(minLength: Int) -> URL {
             ChatMessage(role: .assistant, text: long),
         ]
     ))
-    return scratch
+    // The id goes back to the caller because a launch no longer resumes
+    // anything: the harness has to put the transcript on screen itself, or it
+    // measures an empty panel and reports a pass for work it never did.
+    return (scratch, id)
 }
 
 /// Conversation for the ⌘F harness: long enough to scroll, with the needle in
 /// three widely separated messages so stepping matches must move the scroller.
-func installFindConversation() -> URL {
+func installFindConversation() -> (scratch: URL, id: UUID) {
     let scratch = FileManager.default.temporaryDirectory
         .appendingPathComponent("popchat-find-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
     ConversationStore.overrideDirectory = scratch
@@ -1246,13 +1250,16 @@ func installFindConversation() -> URL {
             text: "\(marker)message \(index). \(body)"
         ))
     }
+    let id = UUID()
     ConversationStore.save(Conversation(
-        id: UUID(),
+        id: id,
         title: "find harness",
         updatedAt: Date(),
         messages: messages
     ))
-    return scratch
+    // Same reason as installBenchmarkConversation: a launch starts a fresh
+    // chat, so seeding the store is not enough to put a transcript on screen.
+    return (scratch, id)
 }
 
 /// The transcript scroller is the vertically-scrollable NSScrollView with the
@@ -1278,7 +1285,7 @@ func transcriptScrollView(in root: NSView?) -> NSScrollView? {
 // never sit below the expanded minimum (320).
 if CommandLine.arguments.contains("--smoke-minsize") {
     MainActor.assumeIsolated {
-        let scratch = installBenchmarkConversation(minLength: 2_000)
+        let (scratch, benchmarkID) = installBenchmarkConversation(minLength: 2_000)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         // Geometry persisted on a display that is now gone: the panel must come
@@ -1300,9 +1307,10 @@ if CommandLine.arguments.contains("--smoke-minsize") {
         let providerStore = ProviderStore()
         let shortcutStore = ShortcutStore()
         let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.chatStore.loadConversation(benchmarkID)
         controller.show()
         restoreGeometryDefaults() // the panel exists now; don't leave 9000 lying around
-        let originalID = controller.chatStore.conversationID
+        let originalID = benchmarkID
 
         // The enforced minimum lives in the windowWillResize delegate (the
         // NSHostingView zeroes contentMinSize) — probe it like a user drag.
@@ -1419,12 +1427,13 @@ if CommandLine.arguments.contains("--smoke-scroll") {
         }
     }
     MainActor.assumeIsolated {
-        let scratch = installBenchmarkConversation(minLength: 20_000)
+        let (scratch, benchmarkID) = installBenchmarkConversation(minLength: 20_000)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let providerStore = ProviderStore()
         let shortcutStore = ShortcutStore()
         let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.chatStore.loadConversation(benchmarkID)
         controller.show()
 
         var elapsed = 0.0
@@ -1485,12 +1494,13 @@ if CommandLine.arguments.contains("--smoke-typing") {
         }
     }
     MainActor.assumeIsolated {
-        let scratch = installBenchmarkConversation(minLength: 20_000)
+        let (scratch, benchmarkID) = installBenchmarkConversation(minLength: 20_000)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let providerStore = ProviderStore()
         let shortcutStore = ShortcutStore()
         let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.chatStore.loadConversation(benchmarkID)
         controller.show()
 
         func focusedEditor() -> NSTextView? {
@@ -1807,7 +1817,7 @@ if CommandLine.arguments.contains("--smoke-input") {
 // focus, and that ↓/↩ select and open a chat (the popover tears down).
 if CommandLine.arguments.contains("--smoke-history") {
     MainActor.assumeIsolated {
-        let scratch = installFindConversation()
+        let (scratch, _) = installFindConversation()
         for title in ["alpha chat", "beta chat"] {
             ConversationStore.save(Conversation(
                 id: UUID(), title: title, updatedAt: Date(),
@@ -1889,12 +1899,13 @@ if CommandLine.arguments.contains("--smoke-history") {
 // scroller, and that ⎋ tears the bar down again.
 if CommandLine.arguments.contains("--smoke-find") {
     MainActor.assumeIsolated {
-        let scratch = installFindConversation()
+        let (scratch, findID) = installFindConversation()
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let providerStore = ProviderStore()
         let shortcutStore = ShortcutStore()
         let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.chatStore.loadConversation(findID)
         controller.show()
 
         func findField(in root: NSView?) -> NSTextField? {
